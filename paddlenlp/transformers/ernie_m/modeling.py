@@ -71,7 +71,7 @@ class ErnieMEmbeddings(nn.Layer):
             inputs_embeds = self.word_embeddings(input_ids)
 
         if position_ids is None:
-            input_shape = paddle.shape(inputs_embeds)[:-1]
+            input_shape = inputs_embeds.shape[:-1]
             # maybe need use shape op to unify static graph and dynamic graph
             ones = paddle.ones(input_shape, dtype="int64")
             seq_length = paddle.cumsum(ones, axis=1)
@@ -124,7 +124,7 @@ class ErnieMPretrainedModel(PretrainedModel):
     pretrained_resource_files_map = ERNIE_M_PRETRAINED_RESOURCE_FILES_MAP
     base_model_prefix = "ernie_m"
 
-    def init_weights(self, layer):
+    def _init_weights(self, layer):
         """Initialization hook"""
         if isinstance(layer, (nn.Linear, nn.Embedding)):
             # only support dygraph, use truncated_normal and make it inplace
@@ -148,7 +148,7 @@ class ErnieMModel(ErnieMPretrainedModel):
     Refer to the superclass documentation for the generic methods.
 
     This model is also a Paddle `paddle.nn.Layer <https://www.paddlepaddle.org.cn/documentation
-    /docs/en/api/paddle/fluid/dygraph/layers/Layer_en.html>`__ subclass. Use it as a regular Paddle Layer
+    /docs/zh/api/paddle/nn/Layer_cn.html>`__ subclass. Use it as a regular Paddle Layer
     and refer to the Paddle documentation for all matter related to general usage and behavior.
 
     Args:
@@ -173,7 +173,6 @@ class ErnieMModel(ErnieMPretrainedModel):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, config.num_hidden_layers)
         self.pooler = ErnieMPooler(config)
-        self.apply(self.init_weights)
 
     def forward(
         self,
@@ -277,8 +276,9 @@ class ErnieMModel(ErnieMPretrainedModel):
             past_key_values_length = past_key_values[0][0].shape[2]
 
         if attention_mask is None:
+            # TODO(linjieccc): fix attention mask after uie-m related models updated
             attention_mask = paddle.unsqueeze(
-                (input_ids == self.pad_token_id).astype(self.pooler.dense.weight.dtype) * -1e4, axis=[1, 2]
+                (input_ids == 0).astype(self.pooler.dense.weight.dtype) * -1e4, axis=[1, 2]
             )
             if past_key_values is not None:
                 batch_size = past_key_values[0][0].shape[0]
@@ -345,7 +345,6 @@ class ErnieMForSequenceClassification(ErnieMPretrainedModel):
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-        self.apply(self.init_weights)
 
     def forward(
         self,
@@ -418,13 +417,24 @@ class ErnieMForSequenceClassification(ErnieMPretrainedModel):
 
         loss = None
         if labels is not None:
-            if self.num_labels == 1:
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == paddle.int64 or labels.dtype == paddle.int32):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
+
+            if self.config.problem_type == "regression":
                 loss_fct = paddle.nn.MSELoss()
-                loss = loss_fct(logits, labels)
-            elif labels.dtype == paddle.int64 or labels.dtype == paddle.int32:
+                if self.num_labels == 1:
+                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(logits, labels)
+            elif self.config.problem_type == "single_label_classification":
                 loss_fct = paddle.nn.CrossEntropyLoss()
                 loss = loss_fct(logits.reshape((-1, self.num_labels)), labels.reshape((-1,)))
-            else:
+            elif self.config.problem_type == "multi_label_classification":
                 loss_fct = paddle.nn.BCEWithLogitsLoss()
                 loss = loss_fct(logits, labels)
 
@@ -455,7 +465,6 @@ class ErnieMForQuestionAnswering(ErnieMPretrainedModel):
         super(ErnieMForQuestionAnswering, self).__init__(config)
         self.ernie_m = ErnieMModel(config)
         self.classifier = nn.Linear(config.hidden_size, 2)
-        self.apply(self.init_weights)
 
     def forward(
         self,
@@ -547,7 +556,7 @@ class ErnieMForQuestionAnswering(ErnieMPretrainedModel):
             if start_positions.ndim > 1:
                 end_positions = end_positions.squeeze(-1)
             # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = paddle.shape(start_logits)[1]
+            ignored_index = start_logits.shape[1]
             start_positions = start_positions.clip(0, ignored_index)
             end_positions = end_positions.clip(0, ignored_index)
 
@@ -587,7 +596,6 @@ class ErnieMForTokenClassification(ErnieMPretrainedModel):
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-        self.apply(self.init_weights)
 
     def forward(
         self,
@@ -687,7 +695,6 @@ class ErnieMForMultipleChoice(ErnieMPretrainedModel):
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.classifier = nn.Linear(config.hidden_size, 1)
-        self.apply(self.init_weights)
 
     def forward(
         self,
@@ -788,7 +795,6 @@ class UIEM(ErnieMPretrainedModel):
         self.linear_start = paddle.nn.Linear(config.hidden_size, 1)
         self.linear_end = paddle.nn.Linear(config.hidden_size, 1)
         self.sigmoid = nn.Sigmoid()
-        self.apply(self.init_weights)
 
     def forward(self, input_ids, position_ids=None, attention_mask=None):
         r"""

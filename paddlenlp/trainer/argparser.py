@@ -18,24 +18,40 @@
 
 import dataclasses
 import json
+import os
 import sys
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, ArgumentTypeError
 from copy import copy
 from enum import Enum
 from inspect import isclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, NewType, Optional, Tuple, Union, get_type_hints
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    NewType,
+    Optional,
+    Tuple,
+    Union,
+    get_args,
+    get_type_hints,
+)
+
+from omegaconf import DictConfig, OmegaConf
+
+from ..utils.log import logger
 
 DataClass = NewType("DataClass", Any)
 DataClassType = NewType("DataClassType", Any)
 
 __all__ = [
     "PdArgumentParser",
+    "strtobool",
 ]
 
 
 # From https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
-def string_to_bool(v):
+def strtobool(v):
     if isinstance(v, bool):
         return v
     if v.lower() in ("yes", "true", "t", "y", "1"):
@@ -110,13 +126,14 @@ class PdArgumentParser(ArgumentParser):
                 kwargs["default"] = field.default
             else:
                 kwargs["required"] = True
-        elif field.type is bool or field.type is Optional[bool]:
+        # fix https://github.com/huggingface/transformers/pull/16946
+        elif field.type is bool or field.type == Optional[bool]:
             # Copy the currect kwargs to use to instantiate a `no_*` complement argument below.
             # We do not initialize it here because the `no_*` alternative must be instantiated after the real argument
             bool_kwargs = copy(kwargs)
 
             # Hack because type=bool in argparse does not behave as we want.
-            kwargs["type"] = string_to_bool
+            kwargs["type"] = strtobool
             if field.type is bool or (field.default is not None and field.default is not dataclasses.MISSING):
                 # Default value is False if we have no default when of type bool.
                 default = False if field.default is dataclasses.MISSING else field.default
@@ -127,14 +144,20 @@ class PdArgumentParser(ArgumentParser):
                 # This is the value that will get picked if we do --field_name (without value)
                 kwargs["const"] = True
         elif isclass(origin_type) and issubclass(origin_type, list):
-            kwargs["type"] = field.type.__args__[0]
+            # supprt one dimension list and two dimension list
+            if hasattr(get_args(field.type)[0], "__args__"):
+                kwargs["type"] = field.type.__args__[0].__args__[0]
+                kwargs["action"] = "append"
+            else:
+                kwargs["type"] = field.type.__args__[0]
+
             kwargs["nargs"] = "+"
             if field.default_factory is not dataclasses.MISSING:
                 kwargs["default"] = field.default_factory()
             elif field.default is dataclasses.MISSING:
                 kwargs["required"] = True
         else:
-            kwargs["type"] = field.type
+            kwargs["type"] = json.loads if field.type is dict else field.type
             if field.default is not dataclasses.MISSING:
                 kwargs["default"] = field.default
             elif field.default_factory is not dataclasses.MISSING:
@@ -147,7 +170,7 @@ class PdArgumentParser(ArgumentParser):
         # Order is important for arguments with the same destination!
         # We use a copy of earlier kwargs because the original kwargs have changed a lot before reaching down
         # here and we do not need those changes/additional keys.
-        if field.default is True and (field.type is bool or field.type is Optional[bool]):
+        if field.default is True and (field.type is bool or field.type == Optional[bool]):
             bool_kwargs["default"] = False
             parser.add_argument(f"--no_{field.name}", action="store_false", dest=field.name, **bool_kwargs)
 
@@ -211,6 +234,10 @@ class PdArgumentParser(ArgumentParser):
                 args = fargs + args if args is not None else fargs + sys.argv[1:]
                 # in case of duplicate arguments the first one has precedence
                 # so we append rather than prepend.
+
+        return self.common_parse(args, return_remaining_strings)
+
+    def common_parse(self, args, return_remaining_strings) -> Tuple[DataClass, ...]:
         namespace, remaining_args = self.parse_known_args(args=args)
         outputs = []
         for dtype in self.dataclass_types:
@@ -231,25 +258,111 @@ class PdArgumentParser(ArgumentParser):
 
             return (*outputs,)
 
-    def parse_json_file(self, json_file: str) -> Tuple[DataClass, ...]:
+    def read_json(self, json_file: str) -> list:
+        json_file = Path(json_file)
+        if json_file.exists():
+            with open(json_file, "r") as file:
+                data = json.load(file)
+            json_args = []
+            for key, value in data.items():
+                if isinstance(value, list):
+                    json_args.extend([f"--{key}", *[str(v) for v in value]])
+                elif isinstance(value, dict):
+                    json_args.extend([f"--{key}", json.dumps(value)])
+                else:
+                    json_args.extend([f"--{key}", str(value)])
+            return json_args
+        else:
+            raise FileNotFoundError(f"The argument file {json_file} does not exist.")
+
+    def parse_json_file(self, json_file: str, return_remaining_strings=False) -> Tuple[DataClass, ...]:
         """
         Alternative helper method that does not use `argparse` at all, instead loading a json file and populating the
         dataclass types.
         """
-        data = json.loads(Path(json_file).read_text())
-        outputs = []
-        for dtype in self.dataclass_types:
-            keys = {f.name for f in dataclasses.fields(dtype) if f.init}
-            inputs = {k: v for k, v in data.items() if k in keys}
-            obj = dtype(**inputs)
-            outputs.append(obj)
-        return (*outputs,)
+        json_args = self.read_json(json_file)
+        return self.common_parse(json_args, return_remaining_strings)
+
+    def parse_json_file_and_cmd_lines(self, return_remaining_strings=False) -> Tuple[DataClass, ...]:
+        """
+        Extend the functionality of `parse_json_file` to handle command line arguments in addition to loading a JSON
+        file.
+
+        When there is a conflict between the command line arguments and the JSON file configuration,
+        the command line arguments will take precedence.
+
+        Returns:
+            Tuple consisting of:
+
+                - the dataclass instances in the same order as they were passed to the initializer.abspath
+        """
+        if not sys.argv[1].endswith(".json"):
+            raise ValueError(f"The first argument should be a JSON file, but it is {sys.argv[1]}")
+        json_args = self.read_json(sys.argv[1])
+        # In case of conflict, command line arguments take precedence
+        args = json_args + sys.argv[2:]
+        return self.common_parse(args, return_remaining_strings)
 
     def parse_dict(self, args: dict) -> Tuple[DataClass, ...]:
         """
         Alternative helper method that does not use `argparse` at all, instead uses a dict and populating the dataclass
         types.
         """
+
+        def to_regular_dict(obj):
+            if isinstance(obj, DictConfig):
+                obj = OmegaConf.to_container(obj, resolve=True)
+            if isinstance(obj, dict):
+                return {k: to_regular_dict(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [to_regular_dict(v) for v in obj]
+            return obj
+
+        def get_resume_checkpoint_path(args):
+            """
+            get resume checkpoint path from mpirun env
+            """
+            pdc_init_step = os.getenv("PDC_INIT_STEP")
+            # user defined resume_from_checkpoint
+            user_defined_resume_from_checkpoint = args.get("resume_from_checkpoint", None)
+            if pdc_init_step is None:
+                logger.info(f"user has defined resume_from_checkpoint: {user_defined_resume_from_checkpoint}")
+                return user_defined_resume_from_checkpoint
+            else:
+                if pdc_init_step == "0":
+                    # from_scratch train process launched by pdc longjob
+                    if user_defined_resume_from_checkpoint is None:
+                        logger.info("resume training process from scratch (step 0)")
+                        return None
+                    else:
+                        # Launching the sft_base training process using an initial checkpoint with the starting step set to 0.
+                        # For instance, resume training from the checkpoint located at ‘./output/eb/checkpoint-init’.
+                        logger.info(
+                            f"init_step == 0 and user has defined resume_from_checkpoint: {user_defined_resume_from_checkpoint}"
+                        )
+                        return user_defined_resume_from_checkpoint
+                else:
+                    # pdc_init_step > 0
+                    logger.info(f"resume training process by pdc longjob with resume step: {pdc_init_step}")
+                    resume_checkpoint = os.path.join(args.get("output_dir", None), f"checkpoint-{pdc_init_step}")
+                    if user_defined_resume_from_checkpoint is not None:
+                        logger.warning(
+                            f"pdc_init_step:{pdc_init_step} and resume_ckpt:{user_defined_resume_from_checkpoint} exist together, use resume_checkpoint:{resume_checkpoint}"
+                        )
+                    return resume_checkpoint
+
+        args["resume_from_checkpoint"] = get_resume_checkpoint_path(args)
+        args_for_json = to_regular_dict(args)
+
+        json_filename = args_for_json.get("args_output_to_local")
+        if json_filename:
+            try:
+                with open(json_filename, "w") as json_file:
+                    json.dump(args_for_json, json_file, indent=4)
+            except Exception as e:
+                logger.error(f"Failed to write args output JSON file: {e}")
+                # Optionally handle the error or log it, then continue
+
         outputs = []
         for dtype in self.dataclass_types:
             keys = {f.name for f in dataclasses.fields(dtype) if f.init}

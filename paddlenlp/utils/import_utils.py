@@ -18,11 +18,109 @@ import os
 import shutil
 import site
 import sys
-from typing import Optional, Type
+from typing import Optional, Tuple, Type, Union
 
 import pip
 
 from paddlenlp.utils.log import logger
+
+
+# TODO: This doesn't work for all packages (`bs4`, `faiss`, etc.) Talk to Sylvain to see how to do with it better.
+def _is_package_available(pkg_name: str, return_version: bool = False) -> Union[Tuple[bool, str], bool]:
+    # Check if the package spec exists and grab its version to avoid importing a local directory
+    package_exists = importlib.util.find_spec(pkg_name) is not None
+    package_version = "N/A"
+    if package_exists:
+        try:
+            # Primary method to get the package version
+            package_version = importlib.metadata.version(pkg_name)
+        except importlib.metadata.PackageNotFoundError:
+            # Fallback method: Only for "torch" and versions containing "dev"
+            if pkg_name == "torch":
+                try:
+                    package = importlib.import_module(pkg_name)
+                    temp_version = getattr(package, "__version__", "N/A")
+                    # Check if the version contains "dev"
+                    if "dev" in temp_version:
+                        package_version = temp_version
+                        package_exists = True
+                    else:
+                        package_exists = False
+                except ImportError:
+                    # If the package can't be imported, it's not available
+                    package_exists = False
+            else:
+                # For packages other than "torch", don't attempt the fallback and set as not available
+                package_exists = False
+    if return_version:
+        return package_exists, package_version
+    else:
+        return package_exists
+
+
+_g2p_en_available = _is_package_available("g2p_en")
+_sentencepiece_available = _is_package_available("sentencepiece")
+_sklearn_available = importlib.util.find_spec("sklearn") is not None
+if _sklearn_available:
+    try:
+        importlib.metadata.version("scikit-learn")
+    except importlib.metadata.PackageNotFoundError:
+        _sklearn_available = False
+
+
+# TODO: This doesn't work for all packages (`bs4`, `faiss`, etc.) Talk to Sylvain to see how to do with it better.
+def _is_package_available(pkg_name: str, return_version: bool = False) -> Union[Tuple[bool, str], bool]:
+    # Check if the package spec exists and grab its version to avoid importing a local directory
+    package_exists = importlib.util.find_spec(pkg_name) is not None
+    package_version = "N/A"
+    if package_exists:
+        try:
+            # Primary method to get the package version
+            package_version = importlib.metadata.version(pkg_name)
+        except importlib.metadata.PackageNotFoundError:
+            # Fallback method: Only for "torch" and versions containing "dev"
+            if pkg_name == "torch":
+                try:
+                    package = importlib.import_module(pkg_name)
+                    temp_version = getattr(package, "__version__", "N/A")
+                    # Check if the version contains "dev"
+                    if "dev" in temp_version:
+                        package_version = temp_version
+                        package_exists = True
+                    else:
+                        package_exists = False
+                except ImportError:
+                    # If the package can't be imported, it's not available
+                    package_exists = False
+            else:
+                # For packages other than "torch", don't attempt the fallback and set as not available
+                package_exists = False
+    if return_version:
+        return package_exists, package_version
+    else:
+        return package_exists
+
+
+_g2p_en_available = _is_package_available("g2p_en")
+_sentencepiece_available = _is_package_available("sentencepiece")
+_sklearn_available = importlib.util.find_spec("sklearn") is not None
+if _sklearn_available:
+    try:
+        importlib.metadata.version("scikit-learn")
+    except importlib.metadata.PackageNotFoundError:
+        _sklearn_available = False
+
+
+def is_datasets_available():
+    import importlib
+
+    return importlib.util.find_spec("datasets") is not None
+
+
+def is_protobuf_available():
+    if importlib.util.find_spec("google") is None:
+        return False
+    return importlib.util.find_spec("google.protobuf") is not None
 
 
 def is_paddle_cuda_available() -> bool:
@@ -34,12 +132,24 @@ def is_paddle_cuda_available() -> bool:
         return False
 
 
+def is_g2p_en_available():
+    return _g2p_en_available
+
+
+def is_sentencepiece_available():
+    return _sentencepiece_available
+
+
 def is_paddle_available() -> bool:
     """check if `torch` package is installed
     Returns:
         bool: if `torch` is available
     """
     return is_package_available("paddle")
+
+
+def is_tiktoken_available():
+    return importlib.util.find_spec("tiktoken") is not None
 
 
 def is_psutil_available():
@@ -71,6 +181,22 @@ def is_fast_tokenizer_available() -> bool:
         bool: if `fast_tokenizer` is avaliable
     """
     return is_package_available("fast_tokenizer")
+
+
+def is_tokenizers_available() -> bool:
+    """check if `tokenizers` ia available
+    Returns:
+        bool: if `tokenizers` is available
+    """
+    return is_package_available("tokenizers")
+
+
+def is_paddlenlp_ops_available() -> bool:
+    """check if `paddlenlp_ops` ia avaliable
+    Returns:
+        bool: if `paddlenlp_ops` is avaliable
+    """
+    return is_package_available("paddlenlp_ops")
 
 
 def is_transformers_available() -> bool:
@@ -112,17 +238,11 @@ def install_package(
     # 3. load the pypi mirror to speedup of installing packages
     mirror_key = "PYPI_MIRROR"
     mirror_source = os.environ.get(mirror_key, None)
-    if mirror_source is None:
-        logger.info(
-            f"use <https://mirror.baidu.com/pypi/simple> as the default "
-            f"mirror source. you can also change it by setting `{mirror_key}` environment variable"
-        )
-        mirror_source = "https://mirror.baidu.com/pypi/simple"
-    else:
-        logger.info(f"loading <{mirror_source}> as the final mirror source to install package.")
+    if mirror_source is not None:
+        logger.info(f"loading <{mirror_source}> from as the final mirror source to install package.")
+        arguments += ["-i", mirror_source]
 
-    arguments += ["-i", mirror_source, package_name]
-
+    arguments += [package_name]
     pip.main(arguments)
 
     # 4. add site-package to the top of package
@@ -143,10 +263,11 @@ def uninstall_package(package_name: str, module_name: Optional[str] = None):
     """
     module_name = module_name or package_name
     for site_package_dir in site.getsitepackages():
-        for file in os.listdir(site_package_dir):
-            package_dir = os.path.join(site_package_dir, file)
-            if file.startswith(package_name) and os.path.isdir(package_dir):
-                shutil.rmtree(package_dir)
+        if os.path.exists(site_package_dir):
+            for file in os.listdir(site_package_dir):
+                package_dir = os.path.join(site_package_dir, file)
+                if file.startswith(package_name) and os.path.isdir(package_dir):
+                    shutil.rmtree(package_dir)
 
     for site_package_dir in site.getsitepackages():
         while sys.path[0] == site_package_dir:

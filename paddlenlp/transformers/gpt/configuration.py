@@ -55,11 +55,42 @@ GPT_PRETRAINED_INIT_CONFIGURATION = {
         "bos_token_id": 0,
         "eol_token_id": 3,
     },
+    "gpt3-89B-en": {  # 89B
+        "vocab_size": 51200,
+        "hidden_size": 12288,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 96,
+        "intermediate_size": 49152,
+        "hidden_act": "gelu",
+        "hidden_dropout_prob": 0.1,
+        "attention_probs_dropout_prob": 0.1,
+        "max_position_embeddings": 1024,
+        "type_vocab_size": 1,  # no use
+        "initializer_range": 0.02,
+        "eos_token_id": 50256,
+        "eol_token_id": 198,
+    },
+    "gpt3-175B-en": {  # 175B
+        "vocab_size": 51200,
+        "hidden_size": 12288,
+        "num_hidden_layers": 96,
+        "num_attention_heads": 96,
+        "intermediate_size": 49152,
+        "hidden_act": "gelu",
+        "hidden_dropout_prob": 0.1,
+        "attention_probs_dropout_prob": 0.1,
+        "max_position_embeddings": 1024,
+        "type_vocab_size": 1,  # no use
+        "initializer_range": 0.02,
+        "eos_token_id": 50256,
+        "eol_token_id": 198,
+    },
     "gpt3-13B-en": {  # 13B
+        "architectures": ["GPTForCausalLM"],
         "vocab_size": 50304,
         "hidden_size": 5120,
         "num_hidden_layers": 40,
-        "num_attention_heads": 128,
+        "num_attention_heads": 40,
         "intermediate_size": 20480,
         "hidden_act": "gelu",
         "hidden_dropout_prob": 0.1,
@@ -70,72 +101,27 @@ GPT_PRETRAINED_INIT_CONFIGURATION = {
         "eos_token_id": 50256,
         "eol_token_id": 198,
     },
+    "gpt3-6.7B-en": {  # 6.7B
+        "vocab_size": 50304,
+        "hidden_size": 4096,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "intermediate_size": 16384,
+        "hidden_act": "gelu",
+        "hidden_dropout_prob": 0.1,
+        "attention_probs_dropout_prob": 0.1,
+        "max_position_embeddings": 1024,
+        "type_vocab_size": 16,  # no use
+        "initializer_range": 0.02,
+        "eos_token_id": 50256,
+        "eol_token_id": 198,
+    },
     "gpt3-1.3B-en": {  # 1.3B
         "vocab_size": 50304,
         "hidden_size": 2048,
         "num_hidden_layers": 24,
         "num_attention_heads": 16,
         "intermediate_size": 8192,
-        "hidden_act": "gelu",
-        "hidden_dropout_prob": 0.1,
-        "attention_probs_dropout_prob": 0.1,
-        "max_position_embeddings": 1024,
-        "type_vocab_size": 1,  # no use
-        "initializer_range": 0.02,
-        "eos_token_id": 50256,
-        "eol_token_id": 198,
-    },
-    "gpt2-xl-en": {  # 1558M
-        "vocab_size": 50257,
-        "hidden_size": 1600,
-        "num_hidden_layers": 48,
-        "num_attention_heads": 25,
-        "intermediate_size": 6400,
-        "hidden_act": "gelu",
-        "hidden_dropout_prob": 0.1,
-        "attention_probs_dropout_prob": 0.1,
-        "max_position_embeddings": 1024,
-        "type_vocab_size": 1,  # no use
-        "initializer_range": 0.02,
-        "eos_token_id": 50256,
-        "eol_token_id": 198,
-    },
-    "gpt2-large-en": {  # 774M
-        "vocab_size": 50257,
-        "hidden_size": 1280,
-        "num_hidden_layers": 36,
-        "num_attention_heads": 20,
-        "intermediate_size": 5120,
-        "hidden_act": "gelu",
-        "hidden_dropout_prob": 0.1,
-        "attention_probs_dropout_prob": 0.1,
-        "max_position_embeddings": 1024,
-        "type_vocab_size": 1,  # no use
-        "initializer_range": 0.02,
-        "eos_token_id": 50256,
-        "eol_token_id": 198,
-    },
-    "gpt2-medium-en": {  # 345M
-        "vocab_size": 50304,
-        "hidden_size": 1024,
-        "num_hidden_layers": 24,
-        "num_attention_heads": 16,
-        "intermediate_size": 4096,
-        "hidden_act": "gelu",
-        "hidden_dropout_prob": 0.1,
-        "attention_probs_dropout_prob": 0.1,
-        "max_position_embeddings": 1024,
-        "type_vocab_size": 1,  # no use
-        "initializer_range": 0.02,
-        "eos_token_id": 50256,
-        "eol_token_id": 198,
-    },
-    "gpt2-en": {  # 117M
-        "vocab_size": 50257,
-        "hidden_size": 768,
-        "num_hidden_layers": 12,
-        "num_attention_heads": 12,
-        "intermediate_size": 3072,
         "hidden_act": "gelu",
         "hidden_dropout_prob": 0.1,
         "attention_probs_dropout_prob": 0.1,
@@ -197,7 +183,7 @@ class GPTConfig(PretrainedConfig):
             Number of attention heads for each attention layer in the Transformer encoder.
         intermediate_size (`int`, *optional*, defaults to 3072):
             Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder.
-        hidden_act (`str` or `Callable`, *optional*, defaults to `"gelu"`):
+        hidden_activation (`str` or `Callable`, *optional*, defaults to `"gelu"`):
             The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
             `"relu"`, `"silu"` and `"gelu_new"` are supported.
         hidden_dropout_prob (`float`, *optional*, defaults to 0.1):
@@ -256,39 +242,63 @@ class GPTConfig(PretrainedConfig):
 
     def __init__(
         self,
+        seq_length=1024,
         vocab_size: int = 50304,
         hidden_size: int = 768,
         num_hidden_layers: int = 12,
         num_attention_heads: int = 12,
         intermediate_size: int = 3072,
-        hidden_act: str = "gelu",
+        hidden_activation: str = "gelu",
         hidden_dropout_prob: float = 0.1,
         attention_probs_dropout_prob: float = 0.1,
         max_position_embeddings: int = 512,
         type_vocab_size: int = 16,
         initializer_range: float = 0.02,
+        layer_norm_eps=1e-5,
         pad_token_id: int = 0,
         eos_token_id: int = 7,
         bos_token_id: int = 0,
         eol_token_id: int = 3,
-        topo: int = None,
+        num_partitions: int = 1,
+        normalize_before: bool = True,
+        scale_qk_coeff: float = 1.0,
+        output_attentions: bool = False,
+        ignore_index: int = 0,
+        use_fast_layer_norm: bool = False,
+        fuse_attention_qkv: bool = False,
+        fuse_attention_ffn: bool = False,
+        fused_softmax_with_triangular: bool = False,
         **kwargs
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
-
+        self.seq_length = seq_length
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.intermediate_size = intermediate_size
-        self.hidden_act = hidden_act
+        self.hidden_activation = hidden_activation
         self.hidden_dropout_prob = hidden_dropout_prob
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.max_position_embeddings = max_position_embeddings
         self.type_vocab_size = type_vocab_size
         self.initializer_range = initializer_range
+        self.layer_norm_eps = layer_norm_eps
+
         self.pad_token_id = pad_token_id
         self.eos_token_id = eos_token_id
         self.bos_token_id = bos_token_id
         self.eol_token_id = eol_token_id
-        self.topo = topo
+
+        self.fuse_attention_qkv = fuse_attention_qkv
+        self.fuse_attention_ffn = fuse_attention_ffn
+
+        self.num_partitions = num_partitions
+        self.normalize_before = normalize_before
+        self.scale_qk_coeff = scale_qk_coeff
+
+        self.output_attentions = output_attentions
+        self.ignore_index = ignore_index
+
+        self.use_fast_layer_norm = use_fast_layer_norm
+        self.fused_softmax_with_triangular = fused_softmax_with_triangular

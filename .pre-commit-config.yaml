@@ -1,3 +1,4 @@
+exclude: 'slm/model_zoo/gpt-3;csrc/third_party'
 repos:
 # For Python files
 -   repo: https://github.com/psf/black.git
@@ -7,7 +8,7 @@ repos:
         files: \.(py|pyi)$
         additional_dependencies: [toml]
 -   repo: https://github.com/PyCQA/isort
-    rev: 5.10.1
+    rev: 5.11.5
     hooks:
     -   id: isort
 -   repo: https://github.com/PyCQA/flake8
@@ -43,3 +44,21 @@ repos:
         entry: python .copyright.hook
         language: system
         files: \.(c|cc|cxx|cpp|cu|h|hpp|hxx|proto|xpu|kps|py|sh)$
+# For Markdown files
+-   repo: local
+    hooks:
+    -   id: add-spaces-between-chinese-and-english
+        name: Add spaces between Chinese and English characters
+        entry: python scripts/codestyle/check_spaces.py
+        language: python
+        files: \.(md|markdown)$
+        pass_filenames: true
+# For dead links
+-   repo: local
+    hooks:
+    -   id: check-dead-links
+        name: Check dead links
+        entry: python scripts/codestyle/check_dead_links.py
+        language: python
+        files: \.(md|markdown|rst)$
+        pass_filenames: true

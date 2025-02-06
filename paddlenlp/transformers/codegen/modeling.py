@@ -24,11 +24,11 @@ from paddle.nn import Layer
 from ...utils.env import CONFIG_NAME
 from ...utils.log import logger
 from .. import PretrainedModel, register_base_model
+from ..activations import ACT2FN
 from ..model_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
 )
-from ..nezha.modeling import ACT2FN
 from .configuration import (
     CODEGEN_PRETRAINED_INIT_CONFIGURATION,
     CODEGEN_PRETRAINED_RESOURCE_FILES_MAP,
@@ -135,7 +135,7 @@ class CodeGenAttention(Layer):
         attn_weights = attn_weights / self.scale_attn
         mask_value = paddle.to_tensor(-1e4, dtype=attn_weights.dtype)
         # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-        attn_weights = paddle.where(causal_mask, attn_weights, mask_value)
+        attn_weights = paddle.where(causal_mask.to("bool"), attn_weights, mask_value)
 
         if attention_mask is not None:
             # Apply the attention mask
@@ -287,7 +287,7 @@ class CodeGenPreTrainedModel(PretrainedModel):
     config_class = CodeGenConfig
     base_model_prefix = "transformer"
 
-    def init_weights(self, layer):
+    def _init_weights(self, layer):
         """Initialize the weights."""
         if isinstance(layer, (nn.Linear, nn.Embedding)):
             if isinstance(layer.weight, paddle.Tensor) and paddle.get_default_dtype() == "float32":
@@ -313,7 +313,7 @@ class CodeGenModel(CodeGenPreTrainedModel):
     This model inherits from :class:`~paddlenlp.transformers.model_utils.PretrainedModel`.
     Refer to the superclass documentation for the generic methods.
     This model is also a Paddle `paddle.nn.Layer <https://www.paddlepaddle.org.cn/documentation
-    /docs/en/api/paddle/fluid/dygraph/layers/Layer_en.html>`__ subclass. Use it as a regular Paddle Layer
+    /docs/zh/api/paddle/nn/Layer_cn.html>`__ subclass. Use it as a regular Paddle Layer
     and refer to the Paddle documentation for all matter related to general usage and behavior.
     Args:
         config (:class:`CodeGenConfig`):
@@ -334,9 +334,6 @@ class CodeGenModel(CodeGenPreTrainedModel):
         self.h = nn.LayerList([CodeGenBlock(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(self.embed_dim, epsilon=config.layer_norm_epsilon)
         self.rotary_dim = min(config.rotary_dim, config.n_ctx // config.n_head)
-
-        # Initialize weights and apply final processing
-        self.apply(self.init_weights)
 
     def get_input_embeddings(self):
         return self.wte
@@ -538,9 +535,6 @@ class CodeGenForCausalLM(CodeGenPreTrainedModel):
         super().__init__(config)
         self.transformer = CodeGenModel(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
-
-        # Initialize weights and apply final processing
-        self.apply(self.init_weights)
 
     def get_output_embeddings(self):
         return self.lm_head

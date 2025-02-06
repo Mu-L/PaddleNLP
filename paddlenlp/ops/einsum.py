@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
 import paddle
 
-__all__ = ["einsum"]
+__all__ = ["einsum", "transfer_param"]
 
 
 def einsum(equation, *operands):
@@ -28,7 +29,7 @@ def einsum(equation, *operands):
             Uses uncased letters to specify the dimension of the operands and result. The input
             equation is on the left hand before `->` while the output equation is on the right side.
             Einsum can infer the result shape so that the `->` and the result label letters can be omitted.
-            Operands in the input equation are splited by commas (','), e.g. 'abc,cde' describes two 3D
+            Operands in the input equation are splitted by commas (','), e.g. 'abc,cde' describes two 3D
             operands. The dimensions labeled with same letter should be same or be 1. Ellipsis ('...') can
             be used to specify the broadcast dimensions.
 
@@ -129,14 +130,14 @@ def einsum(equation, *operands):
             is_right_summed_dim = right.shape[i] > 1
             if i in sum_dims_set:
                 if is_left_summed_dim and is_right_summed_dim:
-                    assert left.shape[i] == right.shape[i], "Non-brocast dim should be equal."
+                    assert left.shape[i] == right.shape[i], "Non-broadcast dim should be equal."
                     summed_size *= left.shape[i]
                 elif is_left_summed_dim:
                     left = left.sum(axis=i, keepdim=True)
                 elif is_right_summed_dim:
                     right = right.sum(axis=i, keepdim=True)
             elif is_left_summed_dim and is_right_summed_dim:
-                assert left.shape[i] == right.shape[i], "Non-brocast dim should be equal."
+                assert left.shape[i] == right.shape[i], "Non-broadcast dim should be equal."
                 batch_dims.append(i)
                 batch_size *= left.shape[i]
             elif is_left_summed_dim:
@@ -197,14 +198,14 @@ def einsum(equation, *operands):
     first_ell_idx = 0
     for i, term in enumerate(operand_eqns):
         ell_char_count = 0
-        operand_rank = int(operands[i].rank().numpy())
+        operand_rank = int(operands[i].rank().cpu().numpy())
         curr_num_ell_idxes = operand_rank - len(term) + 3
         dims_in_terms = 0
         curr_operand_idxes = []
         for ch in term:
             if ch == ".":
                 ell_char_count += 1
-                assert ell_char_count <= 3, "The '.' should only exist in one ellispis '...' in term {}".format(term)
+                assert ell_char_count <= 3, "The '.' should only exist in one ellipsis '...' in term {}".format(term)
                 if ell_char_count == 3:
                     if num_ell_idxes == -1:
                         num_ell_idxes = curr_num_ell_idxes
@@ -213,7 +214,7 @@ def einsum(equation, *operands):
                     else:
                         assert (
                             curr_num_ell_idxes == num_ell_idxes
-                        ), "Ellispis in all terms should represent same dimensions ({}).".format(num_ell_idxes)
+                        ), "Ellipsis in all terms should represent same dimensions ({}).".format(num_ell_idxes)
 
                     for j in range(num_ell_idxes):
                         curr_operand_idxes.append(j + first_ell_idx)
@@ -247,11 +248,11 @@ def einsum(equation, *operands):
         for ch in output_eqn:
             if ch == ".":
                 ell_char_count += 1
-                assert ell_char_count <= 3, "The '.' should only exist in one ellispis '...' in term {}".format(
+                assert ell_char_count <= 3, "The '.' should only exist in one ellipsis '...' in term {}".format(
                     output_eqn
                 )
                 if ell_char_count == 3:
-                    assert num_ell_idxes > -1, "Input equation '{}' don't have ellispis.".format(input_eqn)
+                    assert num_ell_idxes > -1, "Input equation '{}' don't have ellipsis.".format(input_eqn)
                     for j in range(num_ell_idxes):
                         idxes_to_output_dims[first_ell_idx + j] = num_output_dims
                         num_output_dims += 1
@@ -269,7 +270,7 @@ def einsum(equation, *operands):
 
                 idxes_to_output_dims[letters_to_idx[letter_num]] = num_output_dims
                 num_output_dims += 1
-    else:  #  num_eqns_size == 1
+    else:  # num_eqns_size == 1
         # Infer the output dims
         if num_ell_idxes >= 0:
             for j in range(num_ell_idxes):
@@ -337,3 +338,30 @@ def einsum(equation, *operands):
     if len(squeeze_dims) != 0:
         result = paddle.squeeze(result, squeeze_dims)
     return result
+
+
+# copy from fast transformers
+def transfer_param(p, is_bias=False, dtype="float16", restore_data=False):
+    param_shape = p.shape
+    # Allow CPU/GPU and float16/float32 transfer
+    # NOTE: str(p.place) differs between paddle develop and 2.2
+    if str(p.dtype)[-len(dtype) :] == dtype and ("gpu" in str(p.place).lower() or "cuda" in str(p.place).lower()):
+        return p
+    if restore_data:
+        if paddle.in_dynamic_mode():
+            param_data = p.numpy()
+            # Creating parameters with Assign initializer is too slow. Maybe we
+            # can cast to fp16 directly and get a tensor, while we do it more
+            # elaborately to get a ParamBase. Also note `VarBase.set_value`
+            # enforce the same dtype and can not be used directly.
+            new_p = type(p)(shape=param_shape, dtype=dtype, is_bias=is_bias)
+            new_p.value().get_tensor().set(param_data.astype(dtype), paddle.framework._current_expected_place())
+            return new_p
+        else:
+            param_data = np.array(paddle.static.global_scope().find_var(p.name).get_tensor())
+    return paddle.create_parameter(
+        shape=param_shape,
+        dtype=dtype,
+        is_bias=is_bias,
+        default_initializer=paddle.nn.initializer.Assign(param_data) if restore_data else None,
+    )

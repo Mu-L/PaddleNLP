@@ -37,11 +37,8 @@ from numpy import allclose, ndarray, transpose
 from paddle import Tensor
 from paddle.nn import Layer
 
-from paddlenlp.utils.env import (
-    CONFIG_NAME,
-    PADDLE_WEIGHT_FILE_NAME,
-    PYTORCH_WEIGHT_FILE_NAME,
-)
+from paddlenlp.utils.distributed import distributed_allgather, distributed_gather
+from paddlenlp.utils.env import CONFIG_NAME, PADDLE_WEIGHTS_NAME, PYTORCH_WEIGHTS_NAME
 from paddlenlp.utils.import_utils import (
     is_package_available,
     is_torch_available,
@@ -49,10 +46,12 @@ from paddlenlp.utils.import_utils import (
 )
 from paddlenlp.utils.log import logger
 from paddlenlp.utils.serialization import load_torch
+from paddlenlp.utils.tools import get_env_device
 
 if TYPE_CHECKING:
     from paddlenlp.transformers import PretrainedConfig, PretrainedModel
 
+from ..utils import device_guard
 
 # the type hinting for pytorch model & layer & tensor
 Module = TypeVar("Module")
@@ -118,6 +117,24 @@ def state_dict_contains_prefix(state_dict: Dict[str, ndarray], prefix: str) -> b
     """check whether state-dict contains `prefix`"""
     prefix_count = sum([1 for key in state_dict.keys() if key.startswith(prefix)])
     return prefix_count > 0
+
+
+def init_name_mappings(mappings: list[StateDictNameMapping]) -> list[StateDictNameMapping]:
+    """init name mapping which are simple mappings"""
+    for index in range(len(mappings)):
+        sub_mapping = mappings[index]
+
+        # if sub_mapping is `str`, so repeat it. eg: [ "word_embedding.weight", ["layer_norm", "LayerNorm"] ]
+        if isinstance(sub_mapping, str):
+            sub_mapping = [sub_mapping]
+
+        if len(sub_mapping) == 1:
+            sub_mapping = sub_mapping * 2
+
+        elif sub_mapping[1] is None:
+            sub_mapping[1] = sub_mapping[0]
+
+        mappings[index] = sub_mapping
 
 
 class StateDictKeysChecker:
@@ -236,17 +253,440 @@ class StateDictKeysChecker:
         return all_diff_keys
 
 
+def naive_fuse_merge_tp(weight_list, is_column=True, fuse_tensor_parts=2):
+    """
+
+    [A1 B1],[A2 B2]  => [A1, A2, B1, B2]
+
+    Args:
+        weight_list (List[np.ndarray]): The splited tensor parallel weight list.
+        is_column (bool, optional): Is ColumnLinear or RowLinear. Defaults to True.
+
+    Returns:
+        weight (np.ndarray): the merged weight.
+    """
+    if is_column:
+        axis = -1
+    else:
+        axis = 0
+
+    reorder = []
+    if isinstance(weight_list[0], np.ndarray):
+        for item in weight_list:
+            reorder.extend(np.split(item, fuse_tensor_parts, axis=axis))
+    else:
+        for item in weight_list:
+            reorder.extend(paddle.split(item, fuse_tensor_parts, axis=axis))
+    # 0 1 2 3 -> 0 2 1 3
+    index = (
+        np.transpose(np.arange(len(reorder)).reshape([len(weight_list), fuse_tensor_parts]), [1, 0])
+        .reshape(-1)
+        .tolist()
+    )
+
+    if isinstance(weight_list[0], np.ndarray):
+        return np.concatenate([reorder[i] for i in index], axis=axis)
+    else:
+        tensor = paddle.concat([reorder[i] for i in index], axis=axis)
+
+        if tensor.place.is_gpu_place():
+            tensor = tensor._copy_to(paddle.CUDAPinnedPlace(), False)
+        return tensor
+
+
+def naive_fuse_split_tp(
+    weight, tensor_parallel_degree, tensor_parallel_rank=None, is_column=True, fuse_tensor_parts=2
+):
+    """
+
+    [A1, A2, B1, B2] => [A1 B1],[A2 B2]
+
+    Args:
+        weight (numpy.ndarray): the tensor weight,
+        tensor_parallel_degree (int): tensor_parallel_degree
+        tensor_parallel_rank (int): tensor_parallel_rank
+        is_column (bool, optional): is ColumnLinear . Defaults to True.
+
+    Returns:
+        tensor (numpy.ndarray): splited weight.
+
+    """
+    axis = -1 if is_column else 0
+    if "PySafeSlice" in str(type(weight)):
+        size = weight.get_shape()[axis]
+        block_size = size // (fuse_tensor_parts * tensor_parallel_degree)
+
+        splited = []
+        if tensor_parallel_rank is None:
+            begin, end, step = 0, fuse_tensor_parts * tensor_parallel_degree, 1
+        else:
+            begin, end, step = tensor_parallel_rank, fuse_tensor_parts * tensor_parallel_degree, tensor_parallel_degree
+        for rank in range(begin, end, step):
+            start = rank * block_size
+            stop = (rank + 1) * block_size
+            if axis == 0 or len(weight.get_shape()) == 1:
+                tensor = weight[start:stop]
+            else:
+                tensor = weight[:, start:stop]
+            splited.append(tensor)
+
+        if tensor_parallel_rank is None:
+            ret = []
+            for tensor_parallel_rank in range(tensor_parallel_degree):
+                ret.append(np.concatenate(splited[tensor_parallel_rank::tensor_parallel_degree], axis=axis))
+            return ret
+
+        return np.concatenate(splited, axis=axis)
+
+    splited = np.split(weight, fuse_tensor_parts * tensor_parallel_degree, axis=axis)
+
+    if tensor_parallel_rank is None:
+        ret = []
+        for tensor_parallel_rank in range(tensor_parallel_degree):
+            ret.append(np.concatenate(splited[tensor_parallel_rank::tensor_parallel_degree], axis=axis))
+        return ret
+
+    return np.concatenate(splited[tensor_parallel_rank::tensor_parallel_degree], axis=axis)
+
+
+def normal_fuse_merge_tp(weight_list, is_column=True):
+    """
+
+    [A1],[A2]  => [A1, A2]
+
+    Args:
+        weight_list (List[np.ndarray]): The splited tensor parallel weight list.
+        is_column (bool, optional): Is ColumnLinear or RowLinear. Defaults to True.
+
+    Returns:
+        weight (np.ndarray): the merged weight.
+    """
+
+    if is_column:
+        if isinstance(weight_list[0], np.ndarray):
+            return np.concatenate(weight_list, axis=-1)
+        else:
+            tensor = paddle.concat(weight_list, axis=-1)
+            if tensor.place.is_gpu_place():
+                tensor = tensor._copy_to(paddle.CUDAPinnedPlace(), False)
+            return tensor
+    else:
+        if isinstance(weight_list[0], np.ndarray):
+            return np.concatenate(weight_list, axis=0)
+        else:
+            tensor = paddle.concat(weight_list, axis=0)
+            if tensor.place.is_gpu_place():
+                tensor = tensor._copy_to(paddle.CUDAPinnedPlace(), False)
+            return tensor
+
+
+def normal_fuse_split_tp(weight, tensor_parallel_degree, tensor_parallel_rank=None, is_column=True):
+    """
+
+    [A1, A2]  =>  [A1],[A2]
+
+    Args:
+        weight (numpy.ndarray): the tensor weight,
+        tensor_parallel_degree (int): tensor_parallel_degree
+        tensor_parallel_rank (int): tensor_parallel_rank
+        is_column (bool, optional): is ColumnLinear . Defaults to True.
+
+    Returns:
+        tensor (numpy.ndarray): splited weight.
+    """
+    dim = -1 if is_column else 0
+    if "PySafeSlice" in str(type(weight)):
+        size = weight.get_shape()[dim]
+        block_size = size // tensor_parallel_degree
+
+        if tensor_parallel_rank is None:
+            begin, end, step = 0, tensor_parallel_degree, 1
+        else:
+            begin, end, step = tensor_parallel_rank, tensor_parallel_rank + 1, 1
+
+        splited = []
+        for rank in range(begin, end, step):
+            start = rank * block_size
+            stop = (rank + 1) * block_size
+
+            if dim == 0 or len(weight.get_shape()) == 1:
+                tensor = weight[start:stop]
+            elif dim == -1:
+                tensor = weight[:, start:stop]
+            else:
+                raise NotImplementedError("Let's make that generic when needed")
+            if tensor_parallel_rank is not None:
+                return tensor
+
+            splited.append(tensor)
+
+        return splited
+
+    size = weight.shape[dim]
+    assert (
+        size % tensor_parallel_degree == 0
+    ), f"The choosen size {size} is not compatible with sharding on {tensor_parallel_degree} shards. for tensor shape {weight.shape}"
+
+    if is_column:
+        splited_weights = np.split(weight, tensor_parallel_degree, axis=-1)
+    else:
+        splited_weights = np.split(weight, tensor_parallel_degree, axis=0)
+
+    if tensor_parallel_rank is not None:
+        return splited_weights[tensor_parallel_rank]
+
+    return splited_weights
+
+
+"""
+There're three types of MultiHeadAttention QKV Layout in Transfomers
+
+tensor_parallel_qkv = [q1, k1, v1, q2, k2, v2]
+naive_merged_qkv    = [q1, q1, k1, k2, v1, v2]
+splited_qkv         = [q1, q1], [k1, k2], [v1, v2]
+
+naive_merged_qkv -> tensor_parallel_qkv
+    : naive_merged_qkv_to_tensor_parallel_qkv
+
+splited_qkv -> tensor_parallel_qkv
+    : splited_qkv_to_tensor_parallel_qkv
+
+
+"""
+
+
+def tensor_parallel_qkv_to_naive_merged_qkv(weight, num_attention_heads):
+    """
+    [q1, k1, v1, q2, k2, v2] => [q1, q1, k1, k2, v1, v2]
+    """
+    qkvs = []
+    partition_dim = -1
+    split_heads = np.split(weight, 3 * num_attention_heads, axis=partition_dim)
+    qkv_weight_num = 3
+
+    for i in range(qkv_weight_num):
+        qkv = np.concatenate(split_heads[i::qkv_weight_num], axis=partition_dim)
+        qkvs.append(qkv)
+
+    return np.concatenate(qkvs, axis=partition_dim)
+
+
+def naive_merged_qkv_to_tensor_parallel_qkv(weight, num_attention_heads):
+    """
+    [q1, q1, k1, k2, v1, v2] => [q1, k1, v1, q2, k2, v2]
+    """
+    qkv_pairs = []
+    partition_dim = -1
+    split_heads = np.split(weight, 3 * num_attention_heads, axis=partition_dim)
+
+    for i in range(num_attention_heads):
+        qkv_pair = np.concatenate(split_heads[i::num_attention_heads], axis=partition_dim)
+        qkv_pairs.append(qkv_pair)
+
+    return np.concatenate(qkv_pairs, axis=partition_dim)
+
+
+def splited_qkv_to_tensor_parallel_qkv(weight_list, num_attention_heads):
+    """
+    [q1, k1, v1], [q2, k2, v2] => [q1, q1, k1, k2, v1, v2]
+
+    Args:
+        weight_list (_type_): [Q,K,V] tensor list
+    """
+    assert len(
+        weight_list
+    ), f"weight_list length is not equal 3, it should be Q K V list. but got length {len(weight_list)}"
+    weight = np.concatenate(weight_list, axis=-1)
+    return naive_merged_qkv_to_tensor_parallel_qkv(weight)
+
+
+def fuse_param_func():
+    def fn(fuse_params, is_qkv=False, num_heads=None, num_key_value_heads=None):
+        """fuse function for fusing weights
+
+        (1) fuse_attention_qkv
+            q => [q1,q2,q3,q4]
+            k => [k1,k2,k3,k4] or [k1,k2] for GQA
+            v => [v1,v2,v3,v4] or [v1,v2] for GQA
+            fused weight => [q1,k1,v1,q2,k2,v2,q3,k3,v3,q4,k4,v4]
+                 or for GQA [q1,q2,k1,v1,q3,q4,k2,v2]
+        (2) fuse_attention_ffn
+            directly fuse weights to 1 parts
+            [gate_weight], [up_weight] => [gate_weight, up_weight]
+
+        Args:
+            fuse_params (_type_): to be fused weights
+            is_qkv (bool, optional): for attention qkv weights. Defaults to False.
+            num_heads (_type_, optional): query heads. Defaults to None.
+            num_key_value_heads (_type_, optional): key and value heads. Defaults to None.
+
+        Returns:
+            _type_: fused weights
+        """
+        concat_fn = np.concatenate
+        split_fn = np.split
+        if isinstance(fuse_params[0], paddle.Tensor):
+            concat_fn = paddle.concat
+            split_fn = paddle.split
+
+        if is_qkv:
+            # fuse_attention_qkv
+            assert num_heads, f"num_heads should be number of heads for Q, but got {num_heads}"
+            assert (
+                num_key_value_heads
+            ), f"num_key_value_heads should be number of key_value_heads for K and V, but got {num_key_value_heads}"
+            assert (
+                len(fuse_params) == 3
+            ), f"fuse_params length is not equal 3, it should be Q K V list. but got length {len(fuse_params)}"
+            num_query_groups = num_heads // num_key_value_heads
+            q_list = split_fn(fuse_params[0], num_heads, axis=-1)
+            k_list = split_fn(fuse_params[1], num_key_value_heads, axis=-1)
+            v_list = split_fn(fuse_params[2], num_key_value_heads, axis=-1)
+
+            qkv_pairs = []
+            for i in range(num_key_value_heads):
+                qkv_pairs += q_list[i * num_query_groups : (i + 1) * num_query_groups]
+                qkv_pairs.append(k_list[i])
+                qkv_pairs.append(v_list[i])
+            return concat_fn(qkv_pairs, axis=-1)
+        else:
+            # fuse_attention_ffn
+            return concat_fn(fuse_params, axis=-1)
+
+    return fn
+
+
+def split_param_func():
+    def fn(fused_param, split_nums=2, is_qkv=False, num_heads=None, num_key_value_heads=None):
+        """split function for splitting weights
+
+        (1) fuse_attention_qkv
+            fused weight => [q1,k1,v1,q2,k2,v2,q3,k3,v3,q4,k4,v4]
+                 or for GQA [q1,q2,k1,v1,q3,q4,k2,v2]
+            after split
+            q => [q1,q2,q3,q4]
+            k => [k1,k2,k3,k4] or [k1,k2] for GQA
+            v => [v1,v2,v3,v4] or [v1,v2] for GQA
+        (2) fuse_attention_ffn
+            directly split weight to 2 parts
+            [gate_weight, up_weight] => [gate_weight], [up_weight]
+
+        Args:
+            fused_param (_type_): len(fused_param)=1, only one weight to be splitted
+            split_nums (int, optional): split_nums. Defaults to 2.
+            is_qkv (bool, optional): for attention qkv weights. Defaults to False.
+            num_heads (_type_, optional): query heads. Defaults to None.
+            num_key_value_heads (_type_, optional): key and value heads. Defaults to None.
+
+        Returns:
+            _type_: splitted weights
+        """
+        concat_fn = np.concatenate
+        split_fn = np.split
+        if isinstance(fused_param, paddle.Tensor):
+            concat_fn = paddle.concat
+            split_fn = paddle.split
+
+        if is_qkv:
+            # fuse_attention_qkv
+            assert num_heads, f"num_heads should be number of heads for Q, but got {num_heads}"
+            assert (
+                num_key_value_heads
+            ), f"num_key_value_heads should be number of key_value_heads for K and V, but got {num_key_value_heads}"
+            num_query_groups = num_heads // num_key_value_heads
+            q_list, k_list, v_list = [], [], []
+            split_heads = split_fn(fused_param, num_heads + 2 * num_key_value_heads, axis=-1)
+            for i in range(num_key_value_heads):
+                q_list += split_heads[i * (num_query_groups + 2) : (i + 1) * (num_query_groups + 2) - 2]
+                k_list.append(split_heads[(i + 1) * (num_query_groups + 2) - 2])
+                v_list.append(split_heads[(i + 1) * (num_query_groups + 2) - 1])
+            return concat_fn(q_list, axis=-1), concat_fn(k_list, axis=-1), concat_fn(v_list, axis=-1)
+        else:
+            # fuse_attention_ffn
+            return split_fn(fused_param, split_nums, axis=-1)
+
+    return fn
+
+
+def split_or_fuse_func(is_fuse=True):
+    return fuse_param_func() if is_fuse else split_param_func()
+
+
+def get_tensor_parallel_merge_func(tensor_parallel_degree, tensor_parallel_rank, num_attention_heads=None):
+    def fn(
+        x,
+        is_column=True,
+        transpose=False,
+        is_old_qkv=False,
+        is_naive_2fuse=False,
+        is_naive_3fuse=False,
+    ):
+        if x is None:
+            return None
+
+        if is_naive_2fuse:
+            return naive_fuse_merge_tp(x, is_column=is_column, fuse_tensor_parts=2)
+        elif is_naive_3fuse:
+            return naive_fuse_merge_tp(x, is_column=is_column, fuse_tensor_parts=3)
+        else:
+            x = normal_fuse_merge_tp(x, is_column=is_column)
+
+        if is_old_qkv:
+            assert is_column, "QKV tensor should be column parallel linear."
+            assert num_attention_heads is not None, "is_old_qkv need num_attention_heads"
+            x = tensor_parallel_qkv_to_naive_merged_qkv(x, num_attention_heads)
+        if transpose:
+            x = np.transpose(x, [1, 0])
+
+        return x
+
+    return fn
+
+
+def get_tensor_parallel_split_func(tensor_parallel_degree, tensor_parallel_rank, num_attention_heads=None):
+    def fn(x, is_column=True, transpose=False, is_old_qkv=False, is_naive_2fuse=False, is_naive_3fuse=False):
+        if x is None:
+            return None
+        if transpose:
+            x = np.transpose(x, [1, 0])
+        if is_old_qkv:
+            assert is_column, "QKV tensor should be column parallel linear."
+            assert num_attention_heads is not None, "is_old_qkv need num_attention_heads"
+            x = naive_merged_qkv_to_tensor_parallel_qkv(x, num_attention_heads)
+        if is_naive_2fuse:
+            return naive_fuse_split_tp(
+                x, tensor_parallel_degree, tensor_parallel_rank, is_column=is_column, fuse_tensor_parts=2
+            )
+        if is_naive_3fuse:
+            return naive_fuse_split_tp(
+                x, tensor_parallel_degree, tensor_parallel_rank, is_column=is_column, fuse_tensor_parts=3
+            )
+
+        return normal_fuse_split_tp(x, tensor_parallel_degree, tensor_parallel_rank, is_column=is_column)
+
+    return fn
+
+
+def split_or_merge_func(is_split, tensor_parallel_degree, tensor_parallel_rank, num_attention_heads=None):
+    if is_split:
+        return get_tensor_parallel_split_func(tensor_parallel_degree, tensor_parallel_rank, num_attention_heads)
+    return get_tensor_parallel_merge_func(tensor_parallel_degree, tensor_parallel_rank, num_attention_heads)
+
+
 @dataclass
 class StateDictNameMapping:
     """NameMapping of StateDict between two models"""
 
     source_name: str
-    target_name: str
+    target_name: str = None
 
     action: Optional[str] = None  # the value can be: transpose, merge_last_two_dim
     index: Optional[int] = None
 
     slots: list[str] = None
+
+    def __post_init__(self):
+        self.target_name = self.target_name or self.source_name
 
     def should_transpose(self) -> bool:
         return self.action == "transpose"
@@ -265,6 +705,8 @@ class StateDictNameMapping:
             ndarray: the final tensor
         """
         tensor = state_dict.pop(name)
+        if callable(self.action):
+            return self.action(tensor)
         if self.action == "transpose":
             return transpose(tensor, [1, 0])
         if self.action == "merge_last_two_dim":
@@ -273,12 +715,13 @@ class StateDictNameMapping:
             return np.reshape(tensor, [shape[0], -1])
         if self.action == "split":
             assert self.index is not None, "when action is `split`, index field is required."
-
+            # FIXME if the order of split starts from index=2, no tensor left.
             if self.index < 2:
                 state_dict[name] = tensor
             # qkv is stored in same tensor, so it should be split into 3 arr
             tensors = np.split(tensor, 3, axis=-1)
             return tensors[self.index]
+
         return tensor
 
     def matched(self, text: str) -> bool:
@@ -710,8 +1153,19 @@ class ConversionMixin:
         """
         # FIXME(wj-Mcat): add compatibility with downstream models
         name_mappings = cls._get_name_mappings(config)
-
-        state_dict = load_torch(weight_file)
+        if weight_file.endswith(".index.json"):
+            if ".safetensors." in weight_file:
+                files = [file for file in os.listdir(os.path.dirname(weight_file)) if file.startswith("model-")]
+            else:
+                files = [
+                    file for file in os.listdir(os.path.dirname(weight_file)) if file.startswith("pytorch_model-")
+                ]
+            state_dict = {}
+            for file in files:
+                sub_state_dict = load_torch(os.path.join(os.path.dirname(weight_file), file))
+                state_dict.update(sub_state_dict)
+        else:
+            state_dict = load_torch(weight_file)
 
         # 3. convert state_dict
         all_layer_names = set(state_dict.keys())
@@ -729,8 +1183,9 @@ class ConversionMixin:
             for layer_name in all_layer_names:
                 logger.warning(f"--- {layer_name}")
 
-        model_weight_file = os.path.join(cache_dir, PADDLE_WEIGHT_FILE_NAME)
-        paddle.save(state_dict, model_weight_file)
+        model_weight_file = os.path.join(cache_dir, PADDLE_WEIGHTS_NAME)
+        if not os.path.isfile(model_weight_file):
+            paddle.save(state_dict, model_weight_file)
         return state_dict
 
     @classmethod
@@ -747,6 +1202,265 @@ class ConversionMixin:
             List[StateDictNameMapping]: the name-mappings of pretrained model
         """
         raise NotImplementedError
+
+    @classmethod
+    def get_tensor_parallel_convert_actions(
+        cls, config: PretrainedConfig, loaded_state_dict_keys, is_split=True, ignore_error=False
+    ):
+        name_action_mappings = cls._get_tensor_parallel_mappings(config, is_split=is_split)
+        state_keys_map = cls._resolve_prefix_keys(name_action_mappings.keys(), loaded_state_dict_keys, ignore_error)
+        for k, v in state_keys_map.items():
+            name_action_mappings[v] = name_action_mappings.pop(k)
+        return name_action_mappings
+
+    @classmethod
+    def convert_tensor_parallel(
+        cls, weight_file: str, config: PretrainedConfig, state_dict=None, ignore_error=False
+    ) -> None:
+        """the entry of converting config and converting model file
+
+        Args:
+            weight_file (str | None): the weight file path of `model_state.pdparams` file
+            config (PretrainedConfig): the PretrainedConfig instance of model
+        """
+
+        name_action_mappings = cls._get_tensor_parallel_mappings(config)
+        if state_dict is None:
+            with device_guard("cpu"):
+                state_dict = paddle.load(weight_file, return_numpy=False)
+            logger.info("Starting to convert orignal state_dict to tensor parallel state_dict.")
+
+        state_keys_map = cls._resolve_prefix_keys(name_action_mappings.keys(), state_dict.keys(), ignore_error)
+
+        for k, v in state_keys_map.items():
+            name_action_mappings[v] = name_action_mappings.pop(k)
+
+        for name, action in name_action_mappings.items():
+            if name not in state_dict:
+                if not ignore_error:
+                    logger.warning(f"Key <{name}> not in the model state weight file.")
+                continue
+            tensor = state_dict.pop(name)
+            new_tensor = action(tensor)
+            with device_guard("cpu"):
+                state_dict[name] = paddle.Tensor(new_tensor, zero_copy=True)
+
+        return state_dict
+
+    @classmethod
+    def merge_tensor_parallel(cls, state_dict, config) -> None:
+        """the entry of converting config and converting model file
+
+        Args:
+            input_dir (str | None): the input dir which contains `pytorch_model.bin` and `config.json` file
+            config (PretrainedConfig): the PretrainedConfig instance of model
+        """
+        name_action_mappings = cls._get_tensor_parallel_mappings(config, is_split=False)
+        state_keys_map = cls._resolve_prefix_keys(name_action_mappings.keys(), state_dict.keys())
+
+        for k, v in state_keys_map.items():
+            name_action_mappings[v] = name_action_mappings.pop(k)
+
+        state_dict_to_save = {}
+
+        hcg = paddle.distributed.fleet.get_hybrid_communicate_group()
+        mp_group = hcg.get_model_parallel_group()
+        is_dst = paddle.distributed.get_rank(mp_group) == 0
+
+        for key in state_dict.keys():
+            tensor = state_dict[key]
+            if key in name_action_mappings:
+                if get_env_device() == "xpu":
+                    ret = distributed_allgather(tensor, group=mp_group, offload=True)
+                else:
+                    ret = distributed_gather(tensor, group=mp_group, offload=True)
+                action = name_action_mappings.pop(key)
+                tensor = action(ret) if is_dst else None
+            else:
+                tensor = tensor.cpu().numpy() if is_dst else None
+
+            # keep state dict use paddle.tensor
+            if isinstance(tensor, np.ndarray):
+                with device_guard("cpu"):
+                    tensor = paddle.Tensor(tensor, zero_copy=True)
+
+            state_dict_to_save[key] = tensor
+
+        if len(name_action_mappings) > 0:
+            for x in name_action_mappings.keys():
+                logger.debug(f"key <{x}> need to merge tensor parallel but we can't find in model state.")
+
+        return state_dict_to_save
+
+    @classmethod
+    def _get_tensor_parallel_mappings(cls, config: PretrainedConfig, is_split=True) -> List[StateDictNameMapping]:
+        """get name mapping of PretrainedModel
+
+        Args:
+            config (PretrainedConfig): the configuration of name-mapping
+
+        Raises:
+            NotImplementedError:
+
+        Returns:
+            List[StateDictNameMapping]: the name-mappings for tensor_parallel
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def _resolve_prefix_keys(state_keys_base, state_keys_real, ignore_error=False):
+        # state_keys_map base to real
+        state_keys_map = {}
+        # sorted by length，match from long to short for A.key B.key ...
+        state_keys_base = sorted(state_keys_base, key=lambda x: len(x), reverse=True)
+        state_keys_real = set(state_keys_real)
+
+        for key in state_keys_base:
+            for x in state_keys_real:
+                if x.endswith(key):
+                    state_keys_map[key] = x
+                    break
+            if key not in state_keys_map:
+                if not ignore_error:
+                    logger.debug(f"tensor parallel conversion: could not find name {key} in loaded state dict!")
+            else:
+                state_keys_real.remove(state_keys_map[key])
+
+        return state_keys_map
+
+    @classmethod
+    def convert_fuse_and_split(cls, config: PretrainedConfig, state_dict, tp_actions=None):
+        loaded_keys = state_dict.keys()
+        # collect and convert fuse/split action
+        fused_and_split_keys = []
+        convert_with_same_keys = []
+        fuse_actions, resume_keys = cls.get_fuse_or_split_param_convert_actions(config, loaded_keys, is_fuse=True)
+        for keys, action in fuse_actions.items():
+            if keys[-1] in keys[:-1]:
+                assert len(keys) == 2, "only 2 keys can be converted with the same name"
+                convert_with_same_keys.append(keys[-1])
+            origin_states = [state_dict.pop(key) for key in keys[:-1]]
+            state_dict[keys[-1]] = action(origin_states)
+            fused_and_split_keys.append(keys[-1])
+            logger.debug(f"Fusing parameter: {keys[:-1]} into {keys[-1]}")
+
+        split_actions, _ = cls.get_fuse_or_split_param_convert_actions(config, loaded_keys, is_fuse=False)
+        for keys, action in split_actions.items():
+            if keys[-1] in keys[:-1]:
+                assert len(keys) == 2, "only 2 keys can be converted with the same name"
+                convert_with_same_keys.append(keys[-1])
+            origin_state = state_dict.pop(keys[-1])
+            split_states = action(origin_state)
+            for key_idx, key in enumerate(keys[:-1]):
+                state_dict[key] = split_states[key_idx]
+                fused_and_split_keys.append(key)
+            logger.debug(f"Splitting parameter: {keys[-1]} into {keys[:-1]}")
+
+        if tp_actions is not None:
+            for key in fused_and_split_keys:
+                if key in convert_with_same_keys:
+                    continue
+
+                for name in tp_actions.keys():
+                    if key.endswith(name):
+                        with device_guard():
+                            state_dict[key] = paddle.Tensor(tp_actions[name](state_dict.pop(key)), zero_copy=True)
+                        break
+
+        # when shard file split the weight as follows, some weights need to be resumed for next shard file
+        # shard-001-file: q_weight, k_weight
+        # shard_002-file: v_weight
+        resume_state_dict = {k: state_dict[k] for k in resume_keys if k in state_dict}
+        return state_dict, resume_state_dict
+
+    @classmethod
+    def get_fuse_or_split_param_convert_actions(
+        cls,
+        config: PretrainedConfig,
+        loaded_state_dict_keys,
+        is_fuse=True,
+        ignore_error=False,
+    ):
+        name_action_mappings = cls._get_fuse_or_split_param_mappings(config, is_fuse)
+        state_keys_map = cls._resolve_prefix_keys_for_fuse_and_split(
+            name_action_mappings.keys(), loaded_state_dict_keys, ignore_error, is_fuse
+        )
+        for k, v in state_keys_map.items():
+            name_action_mappings[v] = name_action_mappings.pop(k)
+
+        # filter name_action_mappings with corresponding weights
+        # fusing: verify all of the keys in name_action_mappings are in loaded_state_dict_keys
+        # splitting: verify the last key in name_action_mappings is in loaded_state_dict_keys
+        filter_name_action = {}
+        resume_keys = []
+        if is_fuse:
+            for k, v in name_action_mappings.items():
+                cond = True
+                if not all(item in loaded_state_dict_keys for item in k[:-1]):
+                    # resume keys for next fuse
+                    resume_keys += k[:-1]
+                    cond = False
+                if cond:
+                    filter_name_action[k] = v
+        else:
+            for k, v in name_action_mappings.items():
+                if k[-1] in loaded_state_dict_keys:
+                    filter_name_action[k] = v
+
+        return filter_name_action, resume_keys
+
+    @classmethod
+    def _get_fuse_or_split_param_mappings(cls, config: PretrainedConfig, is_fuse=True) -> List[StateDictNameMapping]:
+        """get fused parameter mapping of PretrainedModel
+
+        Args:
+            config (PretrainedConfig): the configuration of name-mapping
+
+        Raises:
+            NotImplementedError:
+
+        Returns:
+            List[StateDictNameMapping]: the name-mappings for tensor_parallel
+        """
+        # raise NotImplementedError(
+        #     f"`_get_fuse_or_split_param_mappings` is not implemented for {cls.__name__}`. To implement it, you should "
+        #     f"overwrite this method in the class {cls.__name__} in `{cls.__module__}.py`"
+        # )
+        return {}
+
+    @staticmethod
+    def _resolve_prefix_keys_for_fuse_and_split(state_keys_base, state_keys_real, ignore_error=False, is_fuse=True):
+        state_keys_map = {}
+
+        # use the tuple (x1,x2,x3,x4) as one key, and the prefix of x1,x2,x3 is used as a new key x4 or
+        # the last key x4 is used as new keys x1,x2,x3. And, the tuple also could be (a) (x1, x1) -> convert x1 to x1;
+        # (b) (x1,x2,x3) -> fuse x1 and x2 to x3; (c) (x1,x2,x3,x4) -> fuse x1, x2 and x3 to x4.
+
+        # is_fuse: True -> fuse, False -> split
+        # True: (x1,x2,x3,x4) -> [x1,x2,x3] are exist in state_keys_real, x4 is not exist in state_keys_real
+        # False: (x1,x2,x3,x4) -> [x1,x2,x3] are not exist in state_keys_real, x4 is exist in state_keys_real
+
+        for keys in state_keys_base:
+            prefix = ""
+            if is_fuse:
+                for x in state_keys_real:
+                    for base_key in keys[:-1]:
+                        if x.endswith(base_key):
+                            prefix = x.replace(base_key, "")
+                            break
+                    if prefix != "":
+                        break
+            else:
+                base_key = keys[-1]
+                for x in state_keys_real:
+                    if x.endswith(base_key):
+                        prefix = x.replace(base_key, "")
+                        break
+
+            new_keys = tuple([prefix + key for key in keys])
+            state_keys_map[keys] = new_keys
+
+        return state_keys_map
 
 
 class Converter(ConversionMixin, LogitComparer):
@@ -792,7 +1506,7 @@ class Converter(ConversionMixin, LogitComparer):
         os.makedirs(input_dir, exist_ok=True)
 
         # 1. get pytorch weight file
-        weight_file = os.path.join(input_dir, PYTORCH_WEIGHT_FILE_NAME)
+        weight_file = os.path.join(input_dir, PYTORCH_WEIGHTS_NAME)
         if not os.path.exists(weight_file):
             raise FileNotFoundError(f"pytorch weight file<{weight_file}> not found")
 
@@ -825,6 +1539,6 @@ class Converter(ConversionMixin, LogitComparer):
             for layer_name in all_layer_names:
                 logger.warning(f"--- {layer_name}")
 
-        model_weight_file = os.path.join(input_dir, PADDLE_WEIGHT_FILE_NAME)
+        model_weight_file = os.path.join(input_dir, PADDLE_WEIGHTS_NAME)
         paddle.save(state_dict, model_weight_file)
         return state_dict

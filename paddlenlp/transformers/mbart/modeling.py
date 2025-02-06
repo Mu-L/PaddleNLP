@@ -60,10 +60,10 @@ def shift_tokens_right(input_ids, pad_token_id):
     """
     shifted_input_ids = input_ids.clone()
     input_flat = paddle.flatten(shifted_input_ids)
-    batch_size, seq_length = paddle.shape(shifted_input_ids)
+    batch_size, seq_length = shifted_input_ids.shape
     index = paddle.arange(0, batch_size, 1, dtype="int32") * seq_length
     index_of_eos = paddle.cast(shifted_input_ids != pad_token_id, dtype="int32").sum(axis=-1) - 1
-    decoder_start_tokens = paddle.gather(input_flat, index + index_of_eos)
+    decoder_start_tokens = paddle.gather(input_flat, index + index_of_eos.astype(index.dtype))
     shifted_input_ids[:, 1:] = shifted_input_ids[:, :-1].clone()
     shifted_input_ids[:, 0] = decoder_start_tokens
     return shifted_input_ids
@@ -84,7 +84,7 @@ class MBartPretrainedModel(PretrainedModel):
     base_model_prefix = "mbart"
     config_class = MBartConfig
 
-    def init_weights(self, layer):
+    def _init_weights(self, layer):
         """Initialization hook"""
         if isinstance(layer, (nn.Linear, nn.Embedding)):
             # In the dygraph mode, use the `set_value` to reset the parameter directly,
@@ -148,7 +148,6 @@ class MBartEncoder(MBartPretrainedModel):
             normalize_before=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, config.encoder_layers, nn.LayerNorm(config.d_model))
-        self.apply(self.init_weights)
 
     def forward(
         self,
@@ -195,9 +194,9 @@ class MBartEncoder(MBartPretrainedModel):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
-            input_shape = paddle.shape(input_ids)
+            input_shape = input_ids.shape
         elif inputs_embeds is not None:
-            input_shape = paddle.shape(inputs_embeds)[:-1]
+            input_shape = inputs_embeds.shape[:-1]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
@@ -258,7 +257,6 @@ class MBartDecoder(MBartPretrainedModel):
             normalize_before=True,
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, config.decoder_layers, nn.LayerNorm(config.d_model))
-        self.apply(self.init_weights)
 
     def forward(
         self,
@@ -314,10 +312,10 @@ class MBartDecoder(MBartPretrainedModel):
         if decoder_input_ids is not None and decoder_inputs_embeds is not None:
             raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
         elif decoder_input_ids is not None:
-            decoder_input_shape = paddle.shape(decoder_input_ids)
+            decoder_input_shape = decoder_input_ids.shape
             decoder_input_ids = decoder_input_ids.reshape((-1, decoder_input_shape[-1]))
         elif decoder_inputs_embeds is not None:
-            decoder_input_shape = paddle.shape(decoder_inputs_embeds)[:-1]
+            decoder_input_shape = decoder_inputs_embeds.shape[:-1]
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
 
@@ -330,7 +328,7 @@ class MBartDecoder(MBartPretrainedModel):
         if decoder_inputs_embeds is None:
             decoder_inputs_embeds = self.embed_tokens(decoder_input_ids) * self.embed_scale
 
-        past_key_values_length = paddle.shape(cache[0][0].k)[2] if cache is not None else 0
+        past_key_values_length = cache[0][0].k.shape[2] if cache is not None else 0
         decoder_inputs_embed_pos = self.decoder_embed_positions(decoder_input_shape, past_key_values_length)
 
         hidden_states = decoder_inputs_embeds + decoder_inputs_embed_pos
@@ -359,7 +357,7 @@ class MBartModel(MBartPretrainedModel):
     Refer to the superclass documentation for the generic methods.
 
     This model is also a Paddle `paddle.nn.Layer <https://www.paddlepaddle.org.cn/documentation
-    /docs/en/api/paddle/fluid/dygraph/layers/Layer_en.html>`__ subclass. Use it as a regular Paddle Layer
+    /docs/zh/api/paddle/nn/Layer_cn.html>`__ subclass. Use it as a regular Paddle Layer
     and refer to the Paddle documentation for all matter related to general usage and behavior.
 
     Args:
@@ -377,7 +375,6 @@ class MBartModel(MBartPretrainedModel):
         self.encoder = MBartEncoder(config, self.shared)
 
         self.decoder = MBartDecoder(config, self.shared)
-        self.apply(self.init_weights)
 
     def get_encoder(self):
         return self.encoder
@@ -635,7 +632,6 @@ class MBartForSequenceClassification(MBartPretrainedModel):
             config.num_labels,
             config.classifier_dropout if config.classifier_dropout is not None else config.dropout,
         )
-        self.apply(self.init_weights)
 
     def forward(
         self,
@@ -734,7 +730,7 @@ class MBartForSequenceClassification(MBartPretrainedModel):
             return_dict=return_dict,
         )
         output = outputs[0]
-        output_shape = paddle.shape(output)
+        output_shape = output.shape
         if input_ids is not None:
             eos_mask = paddle.cast(input_ids == self.mbart.config.eos_token_id, dtype="int64")
             if len(paddle.unique(paddle.sum(eos_mask, axis=1))) > 1:
@@ -747,16 +743,26 @@ class MBartForSequenceClassification(MBartPretrainedModel):
 
         loss = None
         if labels is not None:
-            if self.num_labels == 1:
-                loss_fct = nn.MSELoss()
-                loss = loss_fct(logits, labels)
-            elif labels.dtype == paddle.int64 or labels.dtype == paddle.int32:
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(logits.reshape((-1, self.num_labels)), labels.reshape((-1,)))
-            else:
-                loss_fct = nn.BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == paddle.int64 or labels.dtype == paddle.int32):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
 
+            if self.config.problem_type == "regression":
+                loss_fct = paddle.nn.MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = paddle.nn.CrossEntropyLoss()
+                loss = loss_fct(logits.reshape((-1, self.num_labels)), labels.reshape((-1,)))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = paddle.nn.BCEWithLogitsLoss()
+                loss = loss_fct(logits, labels)
         if not return_dict:
             if len(outputs) == 2:
                 return (loss, logits) if loss is not None else logits
@@ -790,7 +796,6 @@ class MBartForQuestionAnswering(MBartPretrainedModel):
         super().__init__(config)
         self.mbart = MBartModel(config)
         self.classifier = nn.Linear(config.d_model, 2)
-        self.apply(self.init_weights)
 
     def forward(
         self,
@@ -913,7 +918,7 @@ class MBartForQuestionAnswering(MBartPretrainedModel):
             if start_positions.ndim > 1:
                 end_positions = end_positions.squeeze(-1)
             # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = paddle.shape(start_logits)[1]
+            ignored_index = start_logits.shape[1]
             start_positions = start_positions.clip(0, ignored_index)
             end_positions = end_positions.clip(0, ignored_index)
 
@@ -958,7 +963,6 @@ class MBartForConditionalGeneration(MBartPretrainedModel):
         self.register_buffer(
             "final_logits_bias", paddle.zeros((1, config.vocab_size), dtype=paddle.get_default_dtype())
         )
-        self.apply(self.init_weights)
 
     def get_encoder(self):
         return self.mbart.get_encoder()

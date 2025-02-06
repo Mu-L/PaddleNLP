@@ -17,10 +17,11 @@ from typing import Any, Dict, List, Union
 
 import numpy as np
 from paddle.static import InputSpec
+from scipy.special import expit as np_sigmoid
+from scipy.special import softmax as np_softmax
 
-from paddlenlp.prompt import PromptDataCollatorWithPadding, UTCTemplate
-from paddlenlp.transformers import UTC, AutoTokenizer
-
+from ..prompt import PromptDataCollatorWithPadding, UTCTemplate
+from ..transformers import UTC, AutoTokenizer
 from .task import Task
 from .utils import static_mode_guard
 
@@ -55,6 +56,160 @@ class ZeroShotTextClassificationTask(Task):
         "tokenizer_config": "tokenizer_config.json",
     }
     resource_files_urls = {
+        "utc-xbase": {
+            "model_state": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-xbase/model_state.pdparams",
+                "e751c3a78d4caff923759c0d0547bfe6",
+            ],
+            "config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-xbase/config.json",
+                "4c2b035c71ff226a14236171a1a202a4",
+            ],
+            "vocab_file": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-xbase/vocab.txt",
+                "97eb0ec5a5890c8190e10e251af2e133",
+            ],
+            "special_tokens_map": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-xbase/special_tokens_map.json",
+                "8b3fb1023167bb4ab9d70708eb05f6ec",
+            ],
+            "tokenizer_config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-xbase/tokenizer_config.json",
+                "be86466f6769fde498690269d099ea7c",
+            ],
+        },
+        "utc-base": {
+            "model_state": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-base/model_state.pdparams",
+                "72089351c6fb02bcf8f270fe0cc508e9",
+            ],
+            "config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-base/config.json",
+                "79aa9a69286604436937b03f429f4d34",
+            ],
+            "vocab_file": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-base/vocab.txt",
+                "97eb0ec5a5890c8190e10e251af2e133",
+            ],
+            "special_tokens_map": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-base/special_tokens_map.json",
+                "8b3fb1023167bb4ab9d70708eb05f6ec",
+            ],
+            "tokenizer_config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-base/tokenizer_config.json",
+                "be86466f6769fde498690269d099ea7c",
+            ],
+        },
+        "utc-medium": {
+            "model_state": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-medium/model_state.pdparams",
+                "2802c766a8b880aad910dd5a7db809ae",
+            ],
+            "config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-medium/config.json",
+                "2899cd7c8590dcdc4223e4b1262e2f4e",
+            ],
+            "vocab_file": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-medium/vocab.txt",
+                "97eb0ec5a5890c8190e10e251af2e133",
+            ],
+            "special_tokens_map": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-medium/special_tokens_map.json",
+                "8b3fb1023167bb4ab9d70708eb05f6ec",
+            ],
+            "tokenizer_config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-medium/tokenizer_config.json",
+                "be86466f6769fde498690269d099ea7c",
+            ],
+        },
+        "utc-micro": {
+            "model_state": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-micro/model_state.pdparams",
+                "d9ebdfce9a8c6ebda43630ed18b07c58",
+            ],
+            "config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-micro/config.json",
+                "8c8da9337e09e0c3962196987dca18bd",
+            ],
+            "vocab_file": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-micro/vocab.txt",
+                "97eb0ec5a5890c8190e10e251af2e133",
+            ],
+            "special_tokens_map": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-micro/special_tokens_map.json",
+                "8b3fb1023167bb4ab9d70708eb05f6ec",
+            ],
+            "tokenizer_config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-micro/tokenizer_config.json",
+                "be86466f6769fde498690269d099ea7c",
+            ],
+        },
+        "utc-mini": {
+            "model_state": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-mini/model_state.pdparams",
+                "848a2870cd51bfc22174a2a38884085c",
+            ],
+            "config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-mini/config.json",
+                "933b8ebfcf995b1f965764ac426a2ffa",
+            ],
+            "vocab_file": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-mini/vocab.txt",
+                "97eb0ec5a5890c8190e10e251af2e133",
+            ],
+            "special_tokens_map": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-mini/special_tokens_map.json",
+                "8b3fb1023167bb4ab9d70708eb05f6ec",
+            ],
+            "tokenizer_config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-mini/tokenizer_config.json",
+                "be86466f6769fde498690269d099ea7c",
+            ],
+        },
+        "utc-nano": {
+            "model_state": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-nano/model_state.pdparams",
+                "2bd31212d989619148eda3afebc7354d",
+            ],
+            "config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-nano/config.json",
+                "02fe311fdcc127e56ff0975038cc4d65",
+            ],
+            "vocab_file": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-nano/vocab.txt",
+                "97eb0ec5a5890c8190e10e251af2e133",
+            ],
+            "special_tokens_map": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-nano/special_tokens_map.json",
+                "8b3fb1023167bb4ab9d70708eb05f6ec",
+            ],
+            "tokenizer_config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-nano/tokenizer_config.json",
+                "be86466f6769fde498690269d099ea7c",
+            ],
+        },
+        "utc-pico": {
+            "model_state": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-pico/model_state.pdparams",
+                "f7068d63ad2930de7ac850d475052946",
+            ],
+            "config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-pico/config.json",
+                "c0c7412cdd070edb5a1ce70c7fc68ad3",
+            ],
+            "vocab_file": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-pico/vocab.txt",
+                "97eb0ec5a5890c8190e10e251af2e133",
+            ],
+            "special_tokens_map": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-pico/special_tokens_map.json",
+                "8b3fb1023167bb4ab9d70708eb05f6ec",
+            ],
+            "tokenizer_config": [
+                "https://paddlenlp.bj.bcebos.com/taskflow/zero_shot_text_classification/utc-pico/tokenizer_config.json",
+                "be86466f6769fde498690269d099ea7c",
+            ],
+        },
         "utc-large": {
             "model_state": [
                 "https://bj.bcebos.com/paddlenlp/taskflow/zero_shot_text_classification/utc-large/model_state.pdparams",
@@ -77,9 +232,31 @@ class ZeroShotTextClassificationTask(Task):
                 "dcb0f3257830c0eb1f2de47f2d86f89a",
             ],
         },
+        "__internal_testing__/tiny-random-utc": {
+            "model_state": [
+                "https://bj.bcebos.com/paddlenlp/models/community/__internal_testing__/tiny-random-utc/model_state.pdparams",
+                "d303b59447be690530c35c73f8fd03cd",
+            ],
+            "config": [
+                "https://bj.bcebos.com/paddlenlp/models/community/__internal_testing__/tiny-random-utc/config.json",
+                "3420a6638a7c73c6239eb1d7ca1bc5fe",
+            ],
+            "vocab_file": [
+                "https://bj.bcebos.com/paddlenlp/models/community/__internal_testing__/tiny-random-utc/vocab.txt",
+                "97eb0ec5a5890c8190e10e251af2e133",
+            ],
+            "special_tokens_map": [
+                "https://bj.bcebos.com/paddlenlp/models/community/__internal_testing__/tiny-random-utc/special_tokens_map.json",
+                "8b3fb1023167bb4ab9d70708eb05f6ec",
+            ],
+            "tokenizer_config": [
+                "https://bj.bcebos.com/paddlenlp/models/community/__internal_testing__/tiny-random-utc/tokenizer_config.json",
+                "258fc552c15cec90046066ca122899e2",
+            ],
+        },
     }
 
-    def __init__(self, task: str, model: str = "utc-large", schema: list = None, **kwargs):
+    def __init__(self, task: str, model: str, schema: list = None, **kwargs):
         super().__init__(task=task, model=model, **kwargs)
 
         self._set_utc_schema(schema)
@@ -87,6 +264,7 @@ class ZeroShotTextClassificationTask(Task):
         self._batch_size = kwargs.get("batch_size", 1)
         self._pred_threshold = kwargs.get("pred_threshold", 0.5)
         self._num_workers = kwargs.get("num_workers", 0)
+        self._single_label = kwargs.get("single_label", False)
 
         self._check_task_files()
         self._construct_tokenizer()
@@ -95,15 +273,12 @@ class ZeroShotTextClassificationTask(Task):
 
     def _set_utc_schema(self, schema):
         if schema is None:
-            self._question = None
             self._choices = None
         elif isinstance(schema, list):
-            self._question = ""
             self._choices = schema
         elif isinstance(schema, dict) and len(schema) == 1:
-            for key, value in schema.items():
-                self._question = key
-                self._choices = value
+            for key in schema:
+                self._choices = schema[key]
         else:
             raise ValueError(f"Invalid schema: {schema}.")
 
@@ -135,10 +310,7 @@ class ZeroShotTextClassificationTask(Task):
         """
         Construct the tokenizer for the predictor.
         """
-        if self.from_hf_hub:
-            self._tokenizer = AutoTokenizer.from_pretrained(self._task_path, from_hf_hub=self.from_hf_hub)
-        else:
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model)
+        self._tokenizer = AutoTokenizer.from_pretrained(self._task_path, from_hf_hub=self.from_hf_hub)
         self._collator = PromptDataCollatorWithPadding(self._tokenizer, return_tensors="np")
         self._template = UTCTemplate(self._tokenizer, self._max_seq_len)
 
@@ -150,9 +322,9 @@ class ZeroShotTextClassificationTask(Task):
         if isinstance(inputs, list):
             input_list = []
             for example in inputs:
-                data = {"text_a": "", "text_b": "", "choices": self._choices, "question": self._question}
+                data = {"text_a": "", "text_b": "", "choices": self._choices}
                 if isinstance(example, dict):
-                    for k, v in example.items():
+                    for k in example:
                         if k in data:
                             data[k] = example[k]
                 elif isinstance(example, str):
@@ -173,8 +345,6 @@ class ZeroShotTextClassificationTask(Task):
                     raise ValueError("Invalid inputs, input `text_a` and `text_b` are both missing or empty.")
                 if not isinstance(data["choices"], list) or len(data["choices"]) < 2:
                     raise ValueError("Invalid inputs, label candidates should be a list with length >= 2.")
-                if not isinstance(data["question"], str):
-                    raise ValueError("Invalid inputs, prompt question should be a string.")
                 input_list.append(data)
         else:
             raise TypeError("Invalid input format!")
@@ -192,6 +362,7 @@ class ZeroShotTextClassificationTask(Task):
         batches = [
             tokenized_inputs[idx : idx + self._batch_size] for idx in range(0, len(tokenized_inputs), self._batch_size)
         ]
+        inputs = [inputs[idx : idx + self._batch_size] for idx in range(0, len(inputs), self._batch_size)]
         outputs = {}
         outputs["text"] = inputs
         outputs["batches"] = [self._collator(batch) for batch in batches]
@@ -226,33 +397,31 @@ class ZeroShotTextClassificationTask(Task):
 
         return outputs
 
-    @staticmethod
-    def sigmoid(z):
-        return 1 / (1 + np.exp(-z))
-
     def _postprocess(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """
         This function converts the model logits output to class score and predictions
         """
         outputs = []
-        for logits in inputs["batch_logits"]:
-            scores = self.sigmoid(np.array(logits))
-            output = {}
-            output["predictions"] = []
-            for i, class_score in enumerate(scores[0]):
-                if class_score > self._pred_threshold:
-                    output["predictions"].append({"label": i, "score": class_score})
-            outputs.append(output)
+        for batch_text, batch_logits in zip(inputs["text"], inputs["batch_logits"]):
+            for text, logits in zip(batch_text, batch_logits):
+                output = {}
+                if len(text["text_a"]) > 0:
+                    output["text_a"] = text["text_a"]
+                if len(text["text_b"]) > 0:
+                    output["text_b"] = text["text_b"]
 
-        for i, output in enumerate(outputs):
-            if len(inputs["text"][i]["text_a"]) > 0:
-                output["text_a"] = inputs["text"][i]["text_a"]
-            if len(inputs["text"][i]["text_b"]) > 0:
-                output["text_b"] = inputs["text"][i]["text_b"]
-            for j, pred in enumerate(output["predictions"]):
-                output["predictions"][j] = {
-                    "label": inputs["text"][i]["choices"][pred["label"]],
-                    "score": pred["score"],
-                }
+                if self._single_label:
+                    score = np_softmax(logits, axis=-1)
+                    label = np.argmax(logits, axis=-1)
+                    output["predictions"] = [{"label": text["choices"][label], "score": score[label]}]
+                else:
+                    scores = np_sigmoid(logits)
+                    output["predictions"] = []
+                    if scores.ndim == 2:
+                        scores = scores[0]
+                    for i, class_score in enumerate(scores):
+                        if class_score > self._pred_threshold:
+                            output["predictions"].append({"label": text["choices"][i], "score": class_score})
+                outputs.append(output)
 
         return outputs

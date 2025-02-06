@@ -48,9 +48,9 @@ class AdamWDL(AdamW):
     The AdamWDL optimizer is implemented based on the AdamW Optimization with dynamic lr setting.
     Generally it's used for transformer model.
     We use "layerwise_lr_decay" as default dynamic lr setting method of AdamWDL.
-    “Layer-wise decay” means exponentially decaying the learning rates of individual 
+    “Layer-wise decay” means exponentially decaying the learning rates of individual
     layers in a top-down manner. For example, suppose the 24-th layer uses a learning
-    rate l, and the Layer-wise decay rate is α, then the learning rate of layer m 
+    rate l, and the Layer-wise decay rate is α, then the learning rate of layer m
     is lα^(24-m). See more details on: https://arxiv.org/abs/1906.08237.
     .. math::
         & t = t + 1
@@ -81,8 +81,8 @@ class AdamWDL(AdamW):
             Default: None.
         grad_clip (GradientClipBase, optional): Gradient cliping strategy, it's an instance of
             some derived class of ``GradientClipBase`` . There are three cliping strategies
-            ( :ref:`api_fluid_clip_GradientClipByGlobalNorm` , :ref:`api_fluid_clip_GradientClipByNorm` ,
-            :ref:`api_fluid_clip_GradientClipByValue` ). Default None, meaning there is no gradient clipping.
+            ( :ref:`api_paddle_nn_GradientClipByGlobalNorm` , :ref:`api_paddle_nn_GradientClipByNorm` ,
+            :ref:`api_paddle_nn_GradientClipByValue` ). Default None, meaning there is no gradient clipping.
         lazy_mode (bool, optional): The official Adam algorithm has two moving-average accumulators.
             The accumulators are updated at every step. Every element of the two moving-average
             is updated in both dense mode and sparse mode. If the size of parameter is very large,
@@ -90,10 +90,10 @@ class AdamWDL(AdamW):
             gradient in current mini-batch, so it will be much more faster. But this mode has
             different semantics with the original Adam algorithm and may lead to different result.
             The default value is False.
-        multi_precision (bool, optional): Whether to use multi-precision during weight updating. Default is false.  
+        multi_precision (bool, optional): Whether to use multi-precision during weight updating. Default is false.
         layerwise_decay (float, optional): The layer-wise decay ratio. Defaults to 1.0.
         n_layers (int, optional): The total number of encoder layers. Defaults to 12.
-        set_param_lr_fun (function|None, optional): If it's not None, set_param_lr_fun() will set the the parameter 
+        set_param_lr_fun (function|None, optional): If it's not None, set_param_lr_fun() will set the parameter
             learning rate before it executes Adam Operator. Defaults to :ref:`layerwise_lr_decay`.
         name_dict (dict, optional): The keys of name_dict is dynamic name of model while the value
             of name_dict is static name. Use model.named_parameters() to get name_dict.
@@ -110,7 +110,7 @@ class AdamWDL(AdamW):
                 if "weight" in static_name:
                     ratio = decay_rate**0.5
                 param.optimize_attr["learning_rate"] *= ratio
-            
+
             linear = paddle.nn.Linear(10, 10)
             name_dict = dict()
             for n, p in linear.named_parameters():
@@ -124,7 +124,7 @@ class AdamWDL(AdamW):
                 set_param_lr_fun=simple_lr_setting,
                 layerwise_decay=0.8,
                 name_dict=name_dict)
-            
+
             loss.backward()
             adamwdl.step()
             adamwdl.clear_grad()
@@ -237,10 +237,10 @@ class AdamWDL(AdamW):
             if find_master:
                 master_weight = self._master_weights[param.name]
                 scaled_param = master_weight * decay_coeff
-                paddle.fluid.layers.assign(input=scaled_param, output=master_weight)
+                paddle.assign(scaled_param, output=master_weight)
             else:
                 scaled_param = param * decay_coeff
-                paddle.fluid.layers.assign(input=scaled_param, output=param)
+                paddle.assign(scaled_param, output=param)
 
     def _create_optimization_pass(self, parameters_and_grads):
         optimize_ops = super(AdamWDL, self)._create_optimization_pass(parameters_and_grads)

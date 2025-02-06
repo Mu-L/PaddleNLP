@@ -16,7 +16,6 @@ import json
 import os
 import os.path as osp
 import shutil
-import sys
 import tarfile
 import threading
 import time
@@ -25,42 +24,28 @@ import zipfile
 from collections import OrderedDict
 from typing import Optional, Union
 
+import paddle.distributed as dist
 import requests
+from filelock import FileLock
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 from huggingface_hub.utils import EntryNotFoundError
+from tqdm.auto import tqdm
 
 from .env import DOWNLOAD_SERVER, FAILED_STATUS, SUCCESS_STATUS
-from .file_lock import FileLock
-
-try:
-    from tqdm import tqdm
-except:  # noqa: E722
-
-    class tqdm(object):
-        def __init__(self, total=None, **kwargs):
-            self.total = total
-            self.n = 0
-
-        def update(self, n):
-            self.n += n
-            if self.total is None:
-                sys.stderr.write("\r{0:.1f} bytes".format(self.n))
-            else:
-                sys.stderr.write("\r{0:.1f}%".format(100 * self.n / float(self.total)))
-            sys.stderr.flush()
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            sys.stderr.write("\n")
-
-
+from .fault_tolerance import PDC_DOWNLOAD_ERROR
 from .log import logger
+from .pdc_sdk import (
+    FLASH_DEVICE,
+    PDCErrorCode,
+    PDCErrorMessageMap,
+    pdc_flash_device_available,
+    pdc_tool,
+)
 
 __all__ = ["get_weights_path_from_url"]
 
-COMMUNITY_MODEL_PREFIX = "https://bj.bcebos.com/paddlenlp/models/community/"
+
+COMMUNITY_MODEL_PREFIX = os.getenv("COMMUNITY_MODEL_PREFIX", "https://bj.bcebos.com/paddlenlp/models/community")
 WEIGHTS_HOME = osp.expanduser("~/.cache/paddle/hapi/weights")
 DOWNLOAD_RETRY_LIMIT = 3
 DOWNLOAD_CHECK = False
@@ -164,7 +149,7 @@ def get_path_from_url(url, root_dir, md5sum=None, check_exist=True):
 
 
 def get_path_from_url_with_filelock(
-    url: str, root_dir: str, md5sum: Optional[str] = None, check_exist: bool = True
+    url: str, root_dir: str, md5sum: Optional[str] = None, check_exist: bool = True, timeout: float = -1
 ) -> str:
     """construct `get_path_from_url` for `model_utils` to enable downloading multiprocess-safe
 
@@ -173,6 +158,7 @@ def get_path_from_url_with_filelock(
         root_dir (str): the local download path
         md5sum (str, optional): md5sum string for file. Defaults to None.
         check_exist (bool, optional): whether check the file is exist. Defaults to True.
+        timeout (int, optional): the timeout for downloading. Defaults to -1.
 
     Returns:
         str: the path of downloaded file
@@ -188,7 +174,7 @@ def get_path_from_url_with_filelock(
 
     os.makedirs(os.path.dirname(lock_file_path), exist_ok=True)
 
-    with FileLock(lock_file_path):
+    with FileLock(lock_file_path, timeout=timeout):
         result = get_path_from_url(url=url, root_dir=root_dir, md5sum=md5sum, check_exist=check_exist)
     return result
 
@@ -199,8 +185,7 @@ def _download(url, path, md5sum=None):
     url (str): download url
     path (str): download to given path
     """
-    if not osp.exists(path):
-        os.makedirs(path)
+    os.makedirs(path, exist_ok=True)
 
     fname = osp.split(url)[-1]
     fullname = osp.join(path, fname)
@@ -467,7 +452,9 @@ def url_file_exists(url: str) -> bool:
     return result.status_code == requests.codes.ok
 
 
-def hf_file_exists(repo_id: str, filename: str, token: Union[bool, str, None] = None) -> bool:
+def hf_file_exists(
+    repo_id: str, filename: str, token: Union[bool, str, None] = None, subfolder: Optional[str] = None
+) -> bool:
     """Check whether the HF file exists
 
     Args:
@@ -477,11 +464,12 @@ def hf_file_exists(repo_id: str, filename: str, token: Union[bool, str, None] = 
             - If `True`, the token is read from the HuggingFace config folder.
             - If `False` or `None`, no token is provided.
             - If a string, it's used as the authentication token.
+        subfolder (str, optional) An optional value corresponding to a folder inside the repo.
     Returns:
         bool: whether the HF file exists
     """
 
-    url = hf_hub_url(repo_id, filename)
+    url = hf_hub_url(repo_id=repo_id, filename=filename, subfolder=subfolder)
     try:
         _ = get_hf_file_metadata(
             url=url,
@@ -490,3 +478,115 @@ def hf_file_exists(repo_id: str, filename: str, token: Union[bool, str, None] = 
         return True
     except EntryNotFoundError:
         return False
+
+
+def download_from_pdc(remote_path, local_path, timeout):
+    """Download from remote_path and place to a local_path through PaddleCloud. remote_path has to be uploaded through PaddleCloud as well.
+
+
+    Args:
+        remote_path (`str`):
+            remote path url for download
+        local_path (`str`):
+            local path to place downloaded object
+        timeout (`int`):
+            max wait time for download
+    """
+
+    try:
+        base_dir, _ = os.path.split(os.path.normpath(local_path))
+        if not os.path.exists(base_dir) and base_dir != "":
+            os.makedirs(base_dir, exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(f"{PDC_DOWNLOAD_ERROR}; Failed to parse checkpoint path, details: {e}")
+    start_time = time.time()
+    result = pdc_tool.pdc_download(remote_path, local_path, timeout)
+    end_time = time.time()
+    if result == PDCErrorCode.Success:
+        logger.info(f"Successfully downloaded object from PDC, total time cost: {end_time - start_time} seconds.")
+    elif result == PDCErrorCode.LocalPathExist:
+        logger.warning(
+            f"Skipping download object since file exists at local, total time cost: {end_time - start_time} seconds."
+        )
+    else:
+        raise RuntimeError(
+            f"{PDC_DOWNLOAD_ERROR}; Error occurred when trying to download object from PDC, remote_path: {remote_path}, local_path: {local_path}, timeout: {timeout}; error details: {PDCErrorMessageMap[result]}"
+        )
+
+
+def get_static_model_on_pdc(remote_path, local_path, timeout, enable_flash_device=False):
+    """
+    Get static model from PDC. Use flash device if possible.
+    This function has to be called after distributed env is initialized in distributed mode.
+    Args:
+        remote_path (`str`):
+            remote path url for download
+        local_path (`str`):
+            local path to place downloaded object
+        timeout (`int`):
+            max wait time for download
+        enable_flash_device (`bool`):
+            Whether to use flash device
+    Returns:
+        str: path to load static model
+    """
+    try:
+        base_dir, target_dir = os.path.split(os.path.normpath(local_path))
+        if not os.path.exists(base_dir) and base_dir != "":
+            os.makedirs(base_dir, exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(f"{PDC_DOWNLOAD_ERROR}; Failed to parse checkpoint path, details: {e}")
+
+    assert target_dir != ".", f"{PDC_DOWNLOAD_ERROR}, illegal local_path: {local_path}."
+
+    flash_path = os.path.join(FLASH_DEVICE, target_dir)
+    persistent_path = local_path
+
+    device_id = int(os.getenv("FLAGS_selected_gpus", "0"))
+    if device_id != 0:
+        logger.info("Waiting local process 0...")
+        dist.barrier()
+        return flash_path if (enable_flash_device and os.path.exists(flash_path)) else persistent_path
+
+    # step 1: load from flash device if possible
+    need_download_from_remote = True
+    need_backup_to_flash = False
+    if enable_flash_device and pdc_flash_device_available():
+        logger.info(f"flash device is available, checking status on {flash_path}...")
+        # skip download SC as default when flash device is available
+        need_download_from_remote = False
+        if os.path.exists(flash_path) and pdc_tool.pdc_flash_do_check(flash_path) == PDCErrorCode.Success:
+            logger.info("Static model checked successfully on flash device, ready to load...")
+        else:
+            logger.warning(
+                "flash device is available but no valid static model found on flash device, need to download from remote."
+            )
+            need_download_from_remote = True
+            need_backup_to_flash = True
+    else:
+        logger.info("Flash device is not enabled or available, will download static model from remote.")
+
+    # step 2: download from remote if neccesary
+    if need_download_from_remote:
+        logger.info("Beging download static model from remote...")
+        download_from_pdc(remote_path, persistent_path, timeout)
+        logger.info(f"downloaded static model from remote, path:{persistent_path}")
+
+    # step 3: backup to flash device if flash device is available
+    if enable_flash_device and need_backup_to_flash:
+        result = pdc_tool.pdc_backup_to_flash_device(persistent_path, flash_path)
+        if result == PDCErrorCode.Success:
+            logger.info(f"Backup static model to flash device {flash_path} successfully.")
+        else:
+            logger.error(f"Backup static model to flash device failed, error details: {PDCErrorMessageMap[result]}.")
+
+    # step 4: return flash path if available, otherwise return persistent path
+    if dist.get_world_size() > 1:
+        logger.info("Local node process done, waiting other nodes...")
+        dist.barrier()
+    if enable_flash_device and os.path.exists(flash_path):
+        logger.info(f"static model is ready on flash device, path: {flash_path}")
+        return flash_path
+    else:
+        logger.info(f"static model is only ready on persistent storage, path: {persistent_path}")
+        return persistent_path

@@ -507,7 +507,7 @@ class SoftTemplate(Template):
             `Tuple[Dict[int, int], List[List[int]], int]`:
                 - Mapping from continuous ids to word ids for initialization.
                 - Continuous ids for each part. Id 0 denotes none-continuous part.
-                - Number of unique coutinuous tokens.
+                - Number of unique continuous tokens.
         """
         prompt = self._prompt.copy()
         num_soft_token = 1
@@ -560,7 +560,7 @@ class SoftTemplate(Template):
                     else:
                         soft_id_reindex[part["soft_id"]] = soft_id_list
 
-            # Deal with continous prompt defined by `soft_id`.
+            # Deal with continuous prompt defined by `soft_id`.
             elif "soft_id" in part and part["soft_id"] in soft_id_reindex:
                 soft_id_list = soft_id_reindex[part["soft_id"]]
                 if "length" in part:
@@ -568,7 +568,7 @@ class SoftTemplate(Template):
                 soft_token_ids.append(soft_id_list)
                 part_prompt = {"soft": [self.tokenizer.unk_token] * len(soft_id_list)}
 
-            # Deal with continous prompt with random initialization.
+            # Deal with continuous prompt with random initialization.
             else:
                 if "length" not in part:
                     part["length"] = 1
@@ -602,8 +602,9 @@ class SoftTemplate(Template):
             self.soft_embeddings = nn.Embedding(self.num_soft_token, self.embed_size)
             weight = self.soft_embeddings.weight.clone().detach()
             for soft_id, word_id in soft2word.items():
-                word_id = paddle.to_tensor(word_id)
-                weight[soft_id] = self.word_embeddings(word_id)[0]
+                # squeeze() is used here to be backward compatible with 0-D tensor introduced in paddle 2.5
+                word_id = paddle.to_tensor(word_id).squeeze()
+                weight[soft_id] = self.word_embeddings(word_id)
             self.soft_embeddings.weight.set_value(weight)
 
     def _create_soft_encoders(self, output_size: int = None, activation: nn.Layer = None):
@@ -853,11 +854,11 @@ class AutoTemplate(object):
         template_config_file = os.path.join(data_path, TEMPLATE_CONFIG_FILE)
         if not os.path.isfile(template_config_file):
             raise ValueError("{} not found under {}".format(TEMPLATE_CONFIG_FILE, data_path))
-        with open(template_config_file, "r") as fp:
+        with open(template_config_file, "r", encoding="utf-8") as fp:
             config = [x.strip() for x in fp]
             prompt = json.loads(config[0])
             if len(config) > 1:
-                template_class = json.loads(config[1])
+                template_class = json.loads(config[1])["class"]
             else:
                 template_class = None  # Compatible with previous versions
         template = cls.create_from(

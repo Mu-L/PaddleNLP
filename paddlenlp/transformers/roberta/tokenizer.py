@@ -14,16 +14,16 @@
 # limitations under the License.
 
 import io
-import os
 import json
+import os
 
 from paddle.utils import try_import
 
-from .. import BasicTokenizer, PretrainedTokenizer, WordpieceTokenizer, GPTTokenizer, AddedToken
-from ..gpt.tokenizer import bytes_to_unicode
-from ...utils.downloader import get_path_from_url, COMMUNITY_MODEL_PREFIX
-from ...utils.env import MODEL_HOME
-from ...utils.log import logger
+from paddlenlp.utils.download import resolve_file_path
+
+from ..bert.tokenizer import BasicTokenizer, WordpieceTokenizer
+from ..gpt.tokenizer import GPTTokenizer, bytes_to_unicode
+from ..tokenizer_utils import AddedToken, PretrainedTokenizer
 
 __all__ = ["RobertaTokenizer", "RobertaChineseTokenizer", "RobertaBPETokenizer"]
 
@@ -454,7 +454,7 @@ class RobertaBPETokenizer(GPTTokenizer):
         return _cls + token_ids_0 + _sep + _sep + token_ids_1 + _sep
 
     def get_offset_mapping(self, text):
-        tokens = self._tokenize(text)
+        tokens = self.tokenize(text)
         offset_mapping = []
         offset = 0
         for token in tokens:
@@ -497,7 +497,7 @@ class RobertaBPETokenizer(GPTTokenizer):
         Args:
             token_ids_0 (List[int]):
                 A list of `inputs_ids` for the first sequence.
-            token_ids_1 (List[int], optinal):
+            token_ids_1 (List[int], optional):
                 Optional second list of IDs for sequence pairs. Defaults to None.
             already_has_special_tokens (bool, optional): Whether or not the token list is already
                 formatted with special tokens for the model. Defaults to None.
@@ -591,19 +591,26 @@ class RobertaTokenizer:
             return RobertaBPETokenizer.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         else:
             # Assuming from community-contributed pretrained models
-            config_file = os.path.join(
-                COMMUNITY_MODEL_PREFIX, pretrained_model_name_or_path, cls.tokenizer_config_file
+
+            subfolder = kwargs.pop("subfolder", None)
+            cache_dir = kwargs.pop("cache_dir", None)
+            force_download = kwargs.pop("force_download", False)
+            from_aistudio = kwargs.pop("from_aistudio", False)
+            from_hf_hub = kwargs.pop("from_hf_hub", False)
+
+            resolved_config_file = resolve_file_path(
+                pretrained_model_name_or_path,
+                [cls.tokenizer_config_file],
+                subfolder,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                from_aistudio=from_aistudio,
+                from_hf_hub=from_hf_hub,
             )
-            default_root = os.path.join(MODEL_HOME, pretrained_model_name_or_path)
-            try:
-                resolved_config_file = get_path_from_url(config_file, default_root)
-            except RuntimeError as err:
-                logger.error(err)
-                raise RuntimeError(
-                    f"Can't find load tokenizer_config_file for '{pretrained_model_name_or_path}'.\n"
-                    f"Please make sure that '{pretrained_model_name_or_path}' is:\n"
-                    "a correct model-identifier of community-contributed pretrained models.\n"
-                )
+            assert (
+                resolved_config_file is not None
+            ), f"please make sure {cls.tokenizer_config_file} under {pretrained_model_name_or_path}"
+
             with io.open(resolved_config_file, encoding="utf-8") as f:
                 init_kwargs = json.load(f)
 

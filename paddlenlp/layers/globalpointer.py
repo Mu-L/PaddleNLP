@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-import numpy as np
 import paddle
 import paddle.nn as nn
 
@@ -28,7 +26,7 @@ class RotaryPositionEmbedding(nn.Layer):
         self.register_buffer("cos", freqs.cos(), persistable=False)
 
     def forward(self, x, offset=0):
-        seqlen = paddle.shape(x)[-2]
+        seqlen = x.shape[-2]
         sin, cos = (
             self.sin[offset : offset + seqlen, :],
             self.cos[offset : offset + seqlen, :],

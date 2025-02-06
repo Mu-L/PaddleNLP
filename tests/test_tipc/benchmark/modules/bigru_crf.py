@@ -1,3 +1,17 @@
+# Copyright (c) 2023 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import sys
 
@@ -8,8 +22,8 @@ from paddlenlp.utils.log import logger
 from .model_base import BenchmarkBase
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)))
-from bigru_crf.data import create_data_loader
-from bigru_crf.model import BiGruCrf
+from bigru_crf.data import create_data_loader  # noqa: E402
+from bigru_crf.model import BiGruCrf  # noqa: E402
 
 
 class BiGruCrfBenchmark(BenchmarkBase):
@@ -65,7 +79,23 @@ class BiGruCrfBenchmark(BenchmarkBase):
         ips=None,
         **kwargs
     ):
+        max_mem_reserved_msg = ""
+        max_mem_allocated_msg = ""
+        if paddle.device.is_compiled_with_cuda():
+            max_mem_reserved_msg = f"max_mem_reserved: {paddle.device.cuda.max_memory_reserved() // (1024 ** 2)} MB,"
+            max_mem_allocated_msg = f"max_mem_allocated: {paddle.device.cuda.max_memory_allocated() // (1024 ** 2)} MB"
         logger.info(
-            "global step %d / %d, loss: %f, avg_reader_cost: %.5f sec, avg_batch_cost: %.5f sec, avg_samples: %.5f, ips: %.5f sequences/sec"
-            % (step_id, args.epoch * self.num_batch, loss, reader_cost, batch_cost, num_samples, ips)
+            "global step %d / %d, loss: %f, avg_reader_cost: %.5f sec, avg_batch_cost: %.5f sec, "
+            "avg_samples: %.5f, ips: %.5f sequences/sec, %s %s"
+            % (
+                step_id,
+                args.epoch * self.num_batch,
+                loss,
+                reader_cost,
+                batch_cost,
+                num_samples,
+                ips,
+                max_mem_reserved_msg,
+                max_mem_allocated_msg,
+            )
         )

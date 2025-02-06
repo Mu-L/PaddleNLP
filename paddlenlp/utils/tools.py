@@ -118,12 +118,18 @@ class TimeCostAverage(object):
 
 def get_env_device():
     """
-    Return the device name of running enviroment.
+    Return the device name of running environment.
     """
     if paddle.is_compiled_with_cuda():
         return "gpu"
     elif "npu" in paddle.device.get_all_custom_device_type():
         return "npu"
+    elif "mlu" in paddle.device.get_all_custom_device_type():
+        return "mlu"
+    elif "gcu" in paddle.device.get_all_custom_device_type():
+        return "gcu"
+    elif "intel_hpu" in paddle.device.get_all_custom_device_type():
+        return "intel_hpu"
     elif paddle.is_compiled_with_rocm():
         return "rocm"
     elif paddle.is_compiled_with_xpu():
@@ -367,12 +373,13 @@ class DataConverter(object):
         p = img_file.find("-")
         img_file = img_file[p + 1 :]
 
-        img_path = os.path.join("/".join(self.label_studio_file.split("/")[:-1]), "images", img_file)
+        # Get file path for adapting to windows
+        file_dir = os.path.dirname(self.label_studio_file)
+        # Get image file path
+        img_path = os.path.join(file_dir, "images", img_file)
+
         if not os.path.exists(img_path):
-            logger.warning(
-                "Image file %s not exist in %s"
-                % (img_file, "/".join(self.label_studio_file.split("/")[:-1]) + "images")
-            )
+            logger.warning("Image file %s not exist in %s" % (img_file, os.path.join(file_dir, "images")))
             return None
         logger.info("Parsing image file %s ..." % (img_file))
         doc_parser = DocParser(layout_analysis=self.layout_analysis, ocr_lang=self.ocr_lang)

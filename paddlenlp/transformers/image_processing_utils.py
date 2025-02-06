@@ -17,12 +17,21 @@
 import copy
 import json
 import os
+import tempfile
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
+import aistudio_sdk
 import numpy as np
+from huggingface_hub import (
+    create_repo,
+    get_hf_file_metadata,
+    hf_hub_url,
+    repo_type_and_id_from_hf_id,
+    upload_folder,
+)
+from huggingface_hub.utils import EntryNotFoundError
 
-from ..utils.downloader import COMMUNITY_MODEL_PREFIX, get_path_from_url_with_filelock
-from ..utils.env import MODEL_HOME
+from ..utils.download import resolve_file_path
 from ..utils.log import logger
 from .feature_extraction_utils import BatchFeature as BaseBatchFeature
 
@@ -50,6 +59,7 @@ class ImageProcessingMixin(object):
     extractors.
     """
 
+    pretrained_init_configuration = {}
     _auto_class = None
 
     def __init__(self, **kwargs):
@@ -175,6 +185,116 @@ class ImageProcessingMixin(object):
 
         return [output_image_processor_file]
 
+    def save_to_hf_hub(
+        self,
+        repo_id: str,
+        private: Optional[bool] = None,
+        subfolder: Optional[str] = None,
+        commit_message: Optional[str] = None,
+        revision: Optional[str] = None,
+        create_pr: bool = False,
+    ):
+        """
+        Uploads all elements of this processor to a new HuggingFace Hub repository.
+        Args:
+            repo_id (str): Repository name for your processor in the Hub.
+            private (bool, optional): Whether theprocessor is set to private
+            subfolder (str, optional): Push to a subfolder of the repo instead of the root
+            commit_message (str, optional) — The summary / title / first line of the generated commit. Defaults to: f"Upload {path_in_repo} with huggingface_hub"
+            revision (str, optional) — The git revision to commit from. Defaults to the head of the "main" branch.
+            create_pr (boolean, optional) — Whether or not to create a Pull Request with that commit. Defaults to False.
+                If revision is not set, PR is opened against the "main" branch. If revision is set and is a branch, PR is opened against this branch.
+                If revision is set and is not a branch name (example: a commit oid), an RevisionNotFoundError is returned by the server.
+
+        Returns: The url of the commit of your model in the given repository.
+        """
+        repo_url = create_repo(repo_id, private=private, exist_ok=True)
+
+        # Infer complete repo_id from repo_url
+        # Can be different from the input `repo_id` if repo_owner was implicit
+        _, repo_owner, repo_name = repo_type_and_id_from_hf_id(repo_url)
+
+        repo_id = f"{repo_owner}/{repo_name}"
+
+        # Check if README file already exist in repo
+        try:
+            get_hf_file_metadata(hf_hub_url(repo_id=repo_id, filename="README.md", revision=revision))
+            has_readme = True
+        except EntryNotFoundError:
+            has_readme = False
+
+        with tempfile.TemporaryDirectory() as root_dir:
+            if subfolder is not None:
+                save_dir = os.path.join(root_dir, subfolder)
+            else:
+                save_dir = root_dir
+            # save model
+            self.save_pretrained(save_dir)
+            # Add readme if does not exist
+            logger.info("README.md not found, adding the default README.md")
+            if not has_readme:
+                with open(os.path.join(root_dir, "README.md"), "w") as f:
+                    f.write(f"---\nlibrary_name: paddlenlp\n---\n# {repo_id}")
+
+            # Upload model and return
+            logger.info(f"Pushing to the {repo_id}. This might take a while")
+            return upload_folder(
+                repo_id=repo_id,
+                repo_type="model",
+                folder_path=root_dir,
+                commit_message=commit_message,
+                revision=revision,
+                create_pr=create_pr,
+            )
+
+    def save_to_aistudio(
+        self, repo_id, private=True, license="Apache License 2.0", exist_ok=True, subfolder=None, **kwargs
+    ):
+        """
+        Uploads all elements of this model to a new AiStudio Hub repository.
+        Args:
+            repo_id (str): Repository name for your model/tokenizer in the Hub.
+            token (str): Your token for the Hub.
+            private (bool, optional): Whether the model/tokenizer is set to private. Defaults to True.
+            license (str): The license of your model/tokenizer. Defaults to: "Apache License 2.0".
+            exist_ok (bool, optional): Whether to override existing repository. Defaults to: True.
+            subfolder (str, optional): Push to a subfolder of the repo instead of the root
+        """
+
+        res = aistudio_sdk.hub.create_repo(repo_id=repo_id, private=private, license=license, **kwargs)
+        if "error_code" in res:
+            if res["error_code"] == 10003 and exist_ok:
+                logger.info(
+                    f"Repo {repo_id} already exists, it will override files with the same name. To avoid this, please set exist_ok=False"
+                )
+            else:
+                logger.error(
+                    f"Failed to create repo {repo_id}, error_code: {res['error_code']}, error_msg: {res['error_msg']}"
+                )
+        else:
+            logger.info(f"Successfully created repo {repo_id}")
+
+        with tempfile.TemporaryDirectory() as root_dir:
+            if subfolder is not None:
+                save_dir = os.path.join(root_dir, subfolder)
+            else:
+                save_dir = root_dir
+            # save model
+            self.save_pretrained(save_dir)
+
+            # Upload model and return
+            logger.info(f"Pushing to the {repo_id}. This might take a while")
+            for filename in os.listdir(save_dir):
+                res = aistudio_sdk.hub.upload(
+                    repo_id=repo_id, path_or_fileobj=os.path.join(save_dir, filename), path_in_repo=filename, **kwargs
+                )
+                if "error_code" in res:
+                    logger.error(
+                        f"Failed to upload {filename}, error_code: {res['error_code']}, error_msg: {res['error_msg']}"
+                    )
+                else:
+                    logger.info(f"{filename}: {res['message']}")
+
     @classmethod
     def get_image_processor_dict(
         cls, pretrained_model_name_or_path: Union[str, os.PathLike], **kwargs
@@ -186,41 +306,33 @@ class ImageProcessingMixin(object):
         Parameters:
             pretrained_model_name_or_path (`str` or `os.PathLike`):
                 The identifier of the pre-trained checkpoint from which we want the dictionary of parameters.
+            from_hf_hub (bool, optional): whether to load from Huggingface Hub
+            subfolder (str, optional) An optional value corresponding to a folder inside the repo.
+
 
         Returns:
             `Tuple[Dict, Dict]`: The dictionary(ies) that will be used to instantiate the image processor object.
         """
         cache_dir = kwargs.pop("cache_dir", None)
+        from_hf_hub = kwargs.pop("from_hf_hub", False)
+        from_aistudio = kwargs.pop("from_aistudio", False)
+        subfolder = kwargs.pop("subfolder", "")
+        if subfolder is None:
+            subfolder = ""
 
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
         is_local = os.path.isdir(pretrained_model_name_or_path)
-        if os.path.isdir(pretrained_model_name_or_path):
-            resolved_image_processor_file = os.path.join(pretrained_model_name_or_path, IMAGE_PROCESSOR_NAME)
-        elif os.path.isfile(pretrained_model_name_or_path):
-            resolved_image_processor_file = pretrained_model_name_or_path
-            is_local = True
-        else:
-            # Assuming from community-contributed pretrained models
-            image_processor_file = COMMUNITY_MODEL_PREFIX + pretrained_model_name_or_path + "/" + IMAGE_PROCESSOR_NAME
-            default_root = (
-                cache_dir if cache_dir is not None else os.path.join(MODEL_HOME, pretrained_model_name_or_path)
-            )
-            try:
-                # Load from local folder or from cache or download from model Hub and cache
-                resolved_image_processor_file = get_path_from_url_with_filelock(image_processor_file, default_root)
-            except EnvironmentError:
-                # Raise any environment error raise by `cached_file`. It will have a helpful error message adapted to
-                # the original exception.
-                raise
-            except Exception:
-                # For any other exception, we throw a generic error.
-                raise EnvironmentError(
-                    f"Can't load image processor for '{pretrained_model_name_or_path}'. If you were trying to load"
-                    " it from 'BOS', make sure you don't have a local directory with the"
-                    f" same name. Otherwise, make sure '{pretrained_model_name_or_path}' is the correct path to a"
-                    f" directory containing a {IMAGE_PROCESSOR_NAME} file"
-                )
-
+        resolved_image_processor_file = resolve_file_path(
+            pretrained_model_name_or_path,
+            [IMAGE_PROCESSOR_NAME],
+            subfolder,
+            cache_dir=cache_dir,
+            from_hf_hub=from_hf_hub,
+            from_aistudio=from_aistudio,
+        )
+        assert (
+            resolved_image_processor_file is not None
+        ), f"please make sure {IMAGE_PROCESSOR_NAME} under {pretrained_model_name_or_path}"
         try:
             # Load image_processor dict
             with open(resolved_image_processor_file, "r", encoding="utf-8") as reader:
@@ -235,9 +347,7 @@ class ImageProcessingMixin(object):
         if is_local:
             logger.info(f"loading configuration file {resolved_image_processor_file}")
         else:
-            logger.info(
-                f"loading configuration file {image_processor_file} from cache at {resolved_image_processor_file}"
-            )
+            logger.info(f"loading configuration file from cache at {resolved_image_processor_file}")
 
         return image_processor_dict, kwargs
 
@@ -271,13 +381,12 @@ class ImageProcessingMixin(object):
         for key in to_remove:
             kwargs.pop(key, None)
 
-        logger.info(f"Image processor {image_processor}")
         if return_unused_kwargs:
             return image_processor, kwargs
         else:
             return image_processor
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, *args, **kwargs) -> Dict[str, Any]:
         """
         Serializes this instance to a Python dictionary.
 
@@ -425,8 +534,8 @@ def get_size_dict(
     if not isinstance(size, dict):
         size_dict = convert_to_size_dict(size, max_size, default_to_square, height_width_order)
         logger.info(
-            "{param_name} should be a dictionary on of the following set of keys: {VALID_SIZE_DICT_KEYS}, got {size}."
-            " Converted to {size_dict}.",
+            f"{param_name} should be a dictionary on of the following set of keys: {VALID_SIZE_DICT_KEYS}, got {size}."
+            f" Converted to {size_dict}.",
         )
     else:
         size_dict = size

@@ -195,7 +195,7 @@ class SentenceBackTranslate:
         num_beams (int): The number of beams in the "beam_search"
             strategy. Default to 4.
         use_faster: (bool): Whether to use faster entry of model
-            for FasterGeneration. Default to True.
+            for FasterGeneration. Default to False (already deprecated).
         decode_strategy (str, optional): The decoding strategy in generation.
             Currently, there are three decoding strategies supported:
             "greedy_search", "sampling" and "beam_search". Default to
@@ -209,7 +209,7 @@ class SentenceBackTranslate:
         max_length=128,
         batch_size=1,
         num_beams=4,
-        use_faster=True,
+        use_faster=False,
         decode_strategy="beam_search",
         from_model_name=None,
         to_model_name=None,
@@ -219,7 +219,6 @@ class SentenceBackTranslate:
         self.max_length = max_length
         self.batch_size = batch_size
         self.num_beams = num_beams
-        self.use_faster = use_faster
         self.decode_strategy = decode_strategy
         self.from_model_name = from_model_name
         self.to_model_name = to_model_name
@@ -324,10 +323,9 @@ class SentenceBackTranslate:
                 decode_strategy=self.decode_strategy,
                 num_beams=self.num_beams,
                 max_length=self.max_length,
-                use_faster=self.use_faster,
             )[0]
             for output in outputs:
-                eos = np.where(output.numpy() == eos_id)[0]
+                eos = np.where(output.cpu().numpy() == eos_id)[0]
                 if len(eos) == 0:
                     eos_pos = len(output) - 1
                 else:
@@ -459,7 +457,7 @@ class SentenceContinue:
             "greedy_search", "sampling" and "beam_search". Default to
             "beam_search".
         use_faster: (bool): Whether to use faster entry of model
-            for FasterGeneration. Default to False.
+            for FasterGeneration. Default to False (already deprecated).
         create_n (int):
             Number of augmented sequences.
         batch_size(int):
@@ -491,7 +489,6 @@ class SentenceContinue:
         self.model_name = model_name
         self.max_length = max_length
         self.decode_strategy = decode_strategy
-        self.use_faster = use_faster
         self.create_n = create_n
         self.top_k = top_k
         self.temperature = temperature
@@ -501,7 +498,9 @@ class SentenceContinue:
         self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
         self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.tokenizer.add_special_tokens({"pad_token": self.tokenizer.convert_ids_to_tokens(self.model.pad_token_id)})
+        self.tokenizer.add_special_tokens(
+            {"pad_token": self.tokenizer.convert_ids_to_tokens(self.model.config.pad_token_id)}
+        )
 
     def augment(self, sequences):
         """
@@ -528,15 +527,14 @@ class SentenceContinue:
                 **tokenized_inputs,
                 max_length=self.max_length,
                 decode_strategy=self.decode_strategy,
-                use_faster=self.use_faster,
                 num_return_sequences=self.create_n,
                 top_k=self.top_k,
                 temperature=self.temperature,
                 top_p=self.top_p,
             )[0]
             for i in range(outputs.shape[0]):
-                output = outputs[i].numpy()
-                eos = np.where(output == model.eos_token_id)[0]
+                output = outputs[i].cpu().numpy()
+                eos = np.where(output == model.config.eos_token_id)[0]
                 if len(eos) == 0:
                     eos_pos = len(output) - 1
                 else:

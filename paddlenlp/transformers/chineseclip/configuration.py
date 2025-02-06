@@ -17,7 +17,7 @@
 
 import copy
 import os
-from typing import Optional, Union
+from typing import Union
 
 from ...utils.log import logger
 from ..configuration_utils import PretrainedConfig
@@ -75,7 +75,7 @@ class ChineseCLIPTextConfig(PretrainedConfig):
             [Self-Attention with Relative Position Representations (Shaw et al.)](https://arxiv.org/abs/1803.02155).
             For more information on `"relative_key_query"`, please refer to *Method 4* in [Improve Transformer Models
             with Better Relative Position Embeddings (Huang et al.)](https://arxiv.org/abs/2009.13658).
-        use_cache (`bool`, *optional*, defaults to `True`):
+        use_cache (`bool`, *optional*, defaults to `False`):
             Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if `config.is_decoder=True`.
 
@@ -116,7 +116,7 @@ class ChineseCLIPTextConfig(PretrainedConfig):
         pool_act: str = "tanh",
         fuse: bool = False,
         position_embedding_type="absolute",
-        use_cache=True,
+        use_cache=False,  # may has OOM bug, must set this to False,
         **kwargs
     ):
         kwargs["return_dict"] = kwargs.pop("return_dict", True)
@@ -142,19 +142,15 @@ class ChineseCLIPTextConfig(PretrainedConfig):
         self.use_cache = use_cache
 
     @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: Union[str, os.PathLike],
-        from_hf_hub: bool = False,
-        cache_dir: Optional[str] = None,
-        **kwargs
-    ) -> PretrainedConfig:
-        kwargs.update({"from_hf_hub": from_hf_hub, "cache_dir": cache_dir})
+    def from_pretrained(cls, pretrained_model_name_or_path: Union[str, os.PathLike], **kwargs) -> PretrainedConfig:
         config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
 
         # get the vision config dict if we are loading from ChineseCLIPConfig
         if config_dict.get("model_type") == "chinese_clip":
+            projection_dim = config_dict.get("projection_dim", None)
             config_dict = config_dict["text_config"]
+            if projection_dim is not None:
+                config_dict["projection_dim"] = projection_dim
 
         if "model_type" in config_dict and hasattr(cls, "model_type") and config_dict["model_type"] != cls.model_type:
             logger.warning(
@@ -257,19 +253,15 @@ class ChineseCLIPVisionConfig(PretrainedConfig):
         self.hidden_act = hidden_act
 
     @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: Union[str, os.PathLike],
-        from_hf_hub: bool = False,
-        cache_dir: Optional[str] = None,
-        **kwargs
-    ) -> PretrainedConfig:
-        kwargs.update({"from_hf_hub": from_hf_hub, "cache_dir": cache_dir})
+    def from_pretrained(cls, pretrained_model_name_or_path: Union[str, os.PathLike], **kwargs) -> PretrainedConfig:
         config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
 
         # get the vision config dict if we are loading from ChineseCLIPConfig
         if config_dict.get("model_type") == "chinese_clip":
+            projection_dim = config_dict.get("projection_dim", None)
             config_dict = config_dict["vision_config"]
+            if projection_dim is not None:
+                config_dict["projection_dim"] = projection_dim
 
         if "model_type" in config_dict and hasattr(cls, "model_type") and config_dict["model_type"] != cls.model_type:
             logger.warning(
@@ -374,7 +366,7 @@ class ChineseCLIPConfig(PretrainedConfig):
 
         return cls(text_config=text_config.to_dict(), vision_config=vision_config.to_dict(), **kwargs)
 
-    def to_dict(self):
+    def to_dict(self, *args, **kwargs):
         """
         Serializes this instance to a Python dictionary. Override the default [`~PretrainedConfig.to_dict`].
 
